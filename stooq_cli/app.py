@@ -26,6 +26,7 @@ from textual.widgets.option_list import Option
 from textual_plotext import PlotextPlot
 
 from . import analytics, store
+from .budget import RequestBudget
 from .categories import CATEGORIES, DEFAULT_VIEW, WATCHLIST_KEY, by_key
 from .charts import multi_line_chart, price_chart
 from .client import StooqClient, StooqError
@@ -106,8 +107,15 @@ class HelpScreen(ModalScreen):
 
 [b]General[/b]
   F6            Toggle light / dark theme
+  L             Cycle the daily request budget (60 / 120 / 200 / 300)
   ?             This help
   q or Ctrl+Q   Quit
+
+[b]About the request budget[/b]
+  Stooq caps how much history an address may download per day. The terminal
+  counts its own history requests and stops short of that cap, so browsing,
+  search and cached symbols keep working no matter what. Only downloading
+  new history costs anything; market views and search are always free.
 """
 
     def compose(self) -> ComposeResult:
@@ -222,6 +230,33 @@ class PickSymbolScreen(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+class ConfirmScreen(ModalScreen[bool]):
+    """Yes or no before spending a noticeable slice of the daily budget."""
+
+    BINDINGS = [
+        Binding("escape,n", "no", "No"),
+        Binding("enter,y", "yes", "Yes"),
+    ]
+
+    def __init__(self, title: str, body: str) -> None:
+        super().__init__()
+        self._title = title
+        self._body = body
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm-panel"):
+            yield Label(self._title, id="confirm-title")
+            yield Static(self._body, id="confirm-body")
+            yield Label("[b]Enter[/b] or [b]y[/b] to continue,  [b]Esc[/b] or [b]n[/b] to cancel",
+                        id="confirm-hint")
+
+    def action_yes(self) -> None:
+        self.dismiss(True)
+
+    def action_no(self) -> None:
+        self.dismiss(False)
+
+
 class DetailScreen(Screen):
     """Price chart and statistics for one symbol."""
 
@@ -271,18 +306,21 @@ class DetailScreen(Screen):
     def _load(self) -> None:
         app: StooqApp = self.app  # type: ignore[assignment]
         months = RANGE_MONTHS[self.range_key]
-        years = max(1, -(-months // 12))
+        # Fetch exactly the window being charted. A one month view then costs
+        # a single request instead of a whole year's worth of pages.
+        start = store.start_for_days(int(months * 30.44))
         self.app.call_from_thread(self._begin_loading)
         try:
             df = store.get_history(
                 app.client,
                 self.symbol,
-                years=years,
+                start=start,
+                budget=app.budget,
                 progress=lambda msg: self.app.call_from_thread(
                     self._status, f"Loading {msg}"
                 ),
             )
-        except StooqError as exc:
+        except (StooqError, store.BudgetExhausted) as exc:
             self.app.call_from_thread(self._fail, str(exc))
             return
         self.app.call_from_thread(self._show_history, df)
@@ -317,8 +355,10 @@ class DetailScreen(Screen):
         )
         widget.refresh()
         self._render_stats(df, view)
+        budget = self.app.budget  # type: ignore[attr-defined]
+        used = f" {budget.spent}/{budget.effective_limit} req today." if budget.spent else ""
         self._status(
-            f"{len(view)} sessions shown, {len(df)} cached. "
+            f"{len(view)} sessions shown, {len(df)} cached.{used} "
             "Keys: 1 3 6 y 5 range, a watch, b basket, o open site."
         )
 
@@ -448,11 +488,33 @@ class AnalyticsScreen(Screen):
 
     # -- compute ------------------------------------------------------------
 
-    def _recompute(self) -> None:
+    CONFIRM_THRESHOLD = 12  # requests, above which we ask before spending
+
+    def _recompute(self, confirmed: bool = False) -> None:
         if len(self.state.basket) < 2:
             self._status(
                 "Add at least two symbols to the basket: press a here, or b on any "
                 "symbol in the market views."
+            )
+            return
+        app: StooqApp = self.app  # type: ignore[assignment]
+        start = store.start_for_days(int(self.state.history_years * 365.25))
+        cost = sum(store.estimate_pages(sym, start) for sym in self.state.basket)
+        if cost == 0:
+            # Everything needed is already cached, so this is free.
+            self._compute()
+            return
+        if not confirmed and cost > self.CONFIRM_THRESHOLD:
+            self.app.push_screen(
+                ConfirmScreen(
+                    "Download history?",
+                    f"This needs about {cost} requests for "
+                    f"{len(self.state.basket)} symbols over {self.state.history_years}y.\n"
+                    f"Budget today: {app.budget.spent}/{app.budget.effective_limit} used, "
+                    f"{app.budget.remaining} left.\n\n"
+                    "Shorten the span with t, or remove symbols with x, to spend less.",
+                ),
+                lambda ok: self._recompute(confirmed=True) if ok else None,
             )
             return
         self._compute()
@@ -463,6 +525,7 @@ class AnalyticsScreen(Screen):
         symbols = list(self.state.basket)
         years = self.state.history_years
         window = self.state.rolling_window
+        start = store.start_for_days(int(years * 365.25))
         self.app.call_from_thread(self._begin_loading)
         histories: dict[str, pd.DataFrame] = {}
         try:
@@ -470,8 +533,10 @@ class AnalyticsScreen(Screen):
                 self.app.call_from_thread(
                     self._status, f"Loading history {i}/{len(symbols)}: {sym.upper()}"
                 )
-                histories[sym] = store.get_history(app.client, sym, years=years)
-        except StooqError as exc:
+                histories[sym] = store.get_history(
+                    app.client, sym, start=start, budget=app.budget
+                )
+        except (StooqError, store.BudgetExhausted) as exc:
             self.app.call_from_thread(self._fail, str(exc))
             return
 
@@ -696,6 +761,7 @@ class StooqApp(App):
         Binding("A", "analytics", "Analytics"),
         Binding("s", "cycle_sort", "Sort", show=False),
         Binding("r", "refresh", "Refresh"),
+        Binding("L", "cycle_limit", "Budget", show=False),
         Binding("f6", "toggle_theme", "Theme"),
         Binding("question_mark", "help", "Help"),
         Binding("q", "quit", "Quit", show=False),
@@ -705,6 +771,9 @@ class StooqApp(App):
         super().__init__()
         self.state = store.load_state()
         self.client = StooqClient(store.cookie_path())
+        self.budget = RequestBudget(store.budget_path())
+        if self.state.daily_request_limit:
+            self.budget.set_limit(self.state.daily_request_limit)
         self.rows: list[QuoteRow] = []
         self.page = 1
         self.max_page = 1
@@ -768,10 +837,21 @@ class StooqApp(App):
 
     def _page_indicator(self) -> None:
         label = self.query_one("#page-indicator", Label)
-        if self.state.view == WATCHLIST_KEY or self.max_page <= 1:
-            label.update("")
-        else:
-            label.update(f"page {self.page}/{self.max_page}")
+        parts = []
+        if self.state.view != WATCHLIST_KEY and self.max_page > 1:
+            parts.append(f"page {self.page}/{self.max_page}")
+        parts.append(self._budget_badge())
+        label.update("   ".join(parts))
+
+    def _budget_badge(self) -> str:
+        """Only worth showing once some of the day's allowance is gone."""
+        spent, limit = self.budget.spent, self.budget.effective_limit
+        if self.budget.blocked_today:
+            return "[red]quota reached[/red]"
+        if spent == 0:
+            return ""
+        style = "red" if self.budget.remaining <= 5 else "dim"
+        return f"[{style}]{spent}/{limit} req[/{style}]"
 
     @work(thread=True, exclusive=True, group="load")
     def _load_category(self, category_id: int, page: int) -> None:
@@ -1068,6 +1148,27 @@ class StooqApp(App):
 
     def action_refresh(self) -> None:
         self._activate_view(self.state.view, page=self.page)
+
+    LIMITS = [60, 120, 200, 300]
+
+    def action_cycle_limit(self) -> None:
+        current = self.budget.effective_limit
+        nxt = next((v for v in self.LIMITS if v > current), self.LIMITS[0])
+        self.budget.set_limit(nxt)
+        self.state.daily_request_limit = nxt
+        store.save_state(self.state)
+        self._page_indicator()
+        capped = self.budget.effective_limit
+        note = (
+            f" (held at {capped}, the safe share of Stooq's observed limit)"
+            if capped != nxt
+            else ""
+        )
+        self.notify(
+            f"Daily request budget set to {nxt}{note}. "
+            f"{self.budget.remaining} left today.",
+            timeout=5,
+        )
 
     def action_watch_selected(self) -> None:
         row = self._selected_row()

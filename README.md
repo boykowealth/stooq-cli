@@ -140,6 +140,7 @@ the summary statistics table.
 | Key | Action |
 | --- | --- |
 | `F6` | Toggle light and dark |
+| `L` | Cycle the daily request budget: 60, 120, 200, 300 |
 | `?` | Keyboard help |
 | `q` or `Ctrl+Q` | Quit |
 
@@ -181,13 +182,38 @@ Stooq does not offer a public API, so `stooq` reads the same pages a browser doe
 
 ### The daily request limit
 
-Stooq caps how much data an anonymous address can pull per day. When you reach it, the app says so
-plainly and keeps serving every symbol already in your cache. The limit resets the next day.
-Browsing views and searching stay light; pulling many years of history for many new symbols at
-once is what spends it.
+Stooq caps how much historical data an anonymous address can pull per day. The terminal is built
+so that this never locks you out of the app itself.
 
-Data is retrieved from Stooq for personal use. Check Stooq's terms before relying on it for
-anything else.
+**Only downloading new history costs anything.** Market views, category tables, search and quotes
+are not subject to the limit, and neither is anything already in your cache. Even with the daily
+allowance completely spent, you can still browse every view, search, and open any symbol you have
+looked at before.
+
+**The app stops before Stooq does.** It counts its own history requests against a daily budget of
+120 by default and refuses to go over, keeping a reserve rather than discovering the ceiling by
+getting cut off. The counter appears in the top right once you have used some of it. Press `L` to
+cycle the budget between 60, 120, 200 and 300.
+
+**The budget learns.** If Stooq ever refuses a request anyway, the spend at that moment is
+recorded as an upper bound on the real limit, and later days stay below it. A refusal that arrives
+before any meaningful spending is ignored on purpose: Stooq's day rolls over on its own clock, not
+your local midnight, so the first request of your day can be refused on yesterday's allowance, and
+treating that as the real limit would cap the app near zero permanently.
+
+**Requests are proportional to what you ask for.** Stooq serves history 40 rows per page with no
+way to request more, so cost scales with the span you chart: roughly one request per month of
+daily data. A one month chart costs one request, a year costs about seven, five years about
+thirty-two. The cache means you pay this only once per symbol, and only for days you do not
+already have. Before an analytics run that needs more than a dozen requests, the app tells you the
+estimated cost and asks first.
+
+The practical advice: charting and browsing are cheap, and re-opening symbols is free. Pulling
+five years of daily history for a large basket in one sitting is the only thing that will make a
+dent.
+
+Data is retrieved from Stooq for personal use. Any commercial use is prohibited by Stooq's terms.
+Check them before relying on this for anything else.
 
 ## Configuration
 
@@ -197,6 +223,7 @@ directories:
 | What | Location (Linux) |
 | --- | --- |
 | Watchlist, basket, theme, settings | `~/.local/share/stooq-cli/state.json` |
+| Daily request budget and learned limit | `~/.local/share/stooq-cli/budget.json` |
 | Price history cache and cookies | `~/.cache/stooq-cli/` |
 
 macOS and Windows use their respective equivalents. Deleting the cache directory is always safe;
@@ -224,6 +251,7 @@ through Textual's pilot with the network stubbed out.
 | Module | Responsibility |
 | --- | --- |
 | `client.py` | HTTP session, proof-of-work handshake, pacing, refusal detection |
+| `budget.py` | Daily request cap, with adaptive learning of Stooq's real limit |
 | `scrape.py` | Parsers for category tables, historical quotes and search |
 | `store.py` | History cache and persisted application state |
 | `analytics.py` | Returns, correlations, GARCH, summary statistics |

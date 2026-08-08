@@ -163,9 +163,32 @@ DataTable > .datatable--cursor {
 }
 
 /* -- modals -------------------------------------------------------------- */
-HelpScreen, AddSymbolScreen, PickSymbolScreen {
+HelpScreen, AddSymbolScreen, PickSymbolScreen, ConfirmScreen {
     align: center middle;
     background: $surface 50%;
+}
+
+#confirm-panel {
+    width: 68;
+    max-width: 94%;
+    height: auto;
+    background: $surface;
+    border: round $accent;
+    padding: 1 2;
+}
+
+#confirm-title {
+    text-style: bold;
+    padding: 0 0 1 0;
+}
+
+#confirm-body {
+    height: auto;
+    padding: 0 0 1 0;
+}
+
+#confirm-hint {
+    color: $secondary;
 }
 
 #help-panel {
