@@ -1,0 +1,1106 @@
+"""The stooq terminal application."""
+
+from __future__ import annotations
+
+import webbrowser
+from datetime import date, timedelta
+
+import pandas as pd
+from rich.text import Text
+from textual import on, work
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical
+from textual.screen import ModalScreen, Screen
+from textual.widgets import (
+    DataTable,
+    Footer,
+    Input,
+    Label,
+    OptionList,
+    Static,
+    TabbedContent,
+    TabPane,
+)
+from textual.widgets.option_list import Option
+from textual_plotext import PlotextPlot
+
+from . import analytics, store
+from .categories import CATEGORIES, DEFAULT_VIEW, WATCHLIST_KEY, by_key
+from .charts import multi_line_chart, price_chart
+from .client import StooqClient, StooqError
+from .scrape import QuoteRow, SearchHit, parse_category, parse_search
+from .themes import STOOQ_DARK, STOOQ_LIGHT
+
+VIEW_KEYS = [c.key for c in CATEGORIES] + [WATCHLIST_KEY]
+RANGE_MONTHS = {"1": 1, "3": 3, "6": 6, "y": 12, "5": 60}
+SORT_MODES = ["default", "chg desc", "chg asc", "last desc", "name asc"]
+
+
+def fmt_num(value: float | None, decimals: int = 2) -> str:
+    if value is None:
+        return "-"
+    if abs(value) >= 10000:
+        return f"{value:,.0f}"
+    return f"{value:,.{decimals}f}"
+
+
+def fmt_price(value: float | None) -> str:
+    """Price formatting that suits index levels, futures and FX rates alike:
+    the smaller the quote, the more decimals it needs to stay meaningful."""
+    if value is None:
+        return "-"
+    magnitude = abs(value)
+    if magnitude >= 10000:
+        return f"{value:,.0f}"
+    if magnitude >= 100:
+        return f"{value:,.2f}"
+    if magnitude >= 1:
+        return f"{value:,.4f}".rstrip("0").rstrip(".")
+    return f"{value:,.6f}".rstrip("0").rstrip(".")
+
+
+def change_text(pct: float | None, absolute: float | None, app: App) -> tuple[Text, Text]:
+    theme = app.current_theme
+    up = theme.variables.get("up-color", "green")
+    down = theme.variables.get("down-color", "red")
+    if pct is None:
+        return Text("-"), Text("-")
+    color = up if pct > 0 else down if pct < 0 else None
+    sign = "+" if pct > 0 else ""
+    pct_text = Text(f"{sign}{pct:.2f}%", style=color or "")
+    abs_text = Text(
+        f"{sign}{absolute:,.4g}" if absolute is not None else "-", style=color or ""
+    )
+    return pct_text, abs_text
+
+
+class HelpScreen(ModalScreen):
+    BINDINGS = [Binding("escape,question_mark,q", "dismiss_help", "Close")]
+
+    HELP_TEXT = """\
+[b]Navigation[/b]
+  1-6           Market views (Commodities, Indices, FX, Equities, Bonds, Macro)
+  7             Watchlist
+  [ and ]       Previous / next page of the current view
+  Enter         Open the selected symbol (chart and statistics)
+  Ctrl+L or /   Focus the search bar
+  Escape        Close a screen or the search suggestions
+
+[b]Lists[/b]
+  a             Add selected symbol to the watchlist
+  x             Remove selected symbol from the watchlist
+  b             Toggle selected symbol in the analytics basket
+  s             Cycle table sorting
+  r             Refresh data
+
+[b]Analytics[/b]
+  A             Open the analytics screen (uses the basket)
+  a / x         Add or remove basket symbols (inside analytics)
+  w             Cycle rolling window (30 / 60 / 90 / 120 days)
+  t             Cycle history span (1 / 2 / 3 / 5 years)
+
+[b]Symbol view[/b]
+  1 3 6 y 5     Chart range: 1m, 3m, 6m, 1y, 5y
+  o             Open this symbol on stooq.com in your browser
+
+[b]General[/b]
+  F6            Toggle light / dark theme
+  ?             This help
+  q or Ctrl+Q   Quit
+"""
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="help-panel"):
+            yield Label("stooq terminal - keys", id="help-title")
+            yield Static(self.HELP_TEXT, id="help-text")
+
+    def action_dismiss_help(self) -> None:
+        self.dismiss()
+
+
+class AddSymbolScreen(ModalScreen[SearchHit | None]):
+    """Small search dialog that resolves to a chosen symbol."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, title: str = "Add symbol") -> None:
+        super().__init__()
+        self._title = title
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="add-panel"):
+            yield Label(self._title, id="add-title")
+            yield Input(placeholder="Type a name or ticker, Enter to pick", id="add-input")
+            yield OptionList(id="add-options")
+
+    def on_mount(self) -> None:
+        self.query_one("#add-input", Input).focus()
+        self._hits: list[SearchHit] = []
+        self._timer = None
+
+    @on(Input.Changed, "#add-input")
+    def _debounce(self, event: Input.Changed) -> None:
+        if self._timer is not None:
+            self._timer.stop()
+        query = event.value.strip()
+        if len(query) < 2:
+            self.query_one("#add-options", OptionList).clear_options()
+            return
+        self._timer = self.set_timer(0.35, lambda: self._search(query))
+
+    @work(thread=True, exclusive=True, group="modal-search")
+    def _search(self, query: str) -> None:
+        app: StooqApp = self.app  # type: ignore[assignment]
+        try:
+            hits = parse_search(app.client.search(query))[:9]
+        except StooqError:
+            hits = []
+        self.app.call_from_thread(self._show_hits, hits)
+
+    def _show_hits(self, hits: list[SearchHit]) -> None:
+        self._hits = hits
+        options = self.query_one("#add-options", OptionList)
+        options.clear_options()
+        for hit in hits:
+            label = f"{hit.symbol.upper():<12} {hit.name[:34]:<36} {hit.market}"
+            options.add_option(Option(label, id=hit.symbol))
+        if hits:
+            options.highlighted = 0
+
+    @on(Input.Submitted, "#add-input")
+    def _submit(self) -> None:
+        options = self.query_one("#add-options", OptionList)
+        if self._hits and options.option_count:
+            index = options.highlighted or 0
+            self.dismiss(self._hits[index])
+        else:
+            self.dismiss(None)
+
+    @on(OptionList.OptionSelected, "#add-options")
+    def _selected(self, event: OptionList.OptionSelected) -> None:
+        for hit in self._hits:
+            if hit.symbol == event.option.id:
+                self.dismiss(hit)
+                return
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_key(self, event) -> None:
+        options = self.query_one("#add-options", OptionList)
+        if event.key in ("down", "up") and options.option_count:
+            delta = 1 if event.key == "down" else -1
+            current = options.highlighted or 0
+            options.highlighted = max(0, min(options.option_count - 1, current + delta))
+            event.stop()
+
+
+class PickSymbolScreen(ModalScreen[str | None]):
+    """Pick one symbol from a fixed list (used to remove basket entries)."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, title: str, symbols: list[str]) -> None:
+        super().__init__()
+        self._title = title
+        self._symbols = symbols
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="add-panel"):
+            yield Label(self._title, id="add-title")
+            yield OptionList(
+                *[Option(sym.upper(), id=sym) for sym in self._symbols], id="pick-options"
+            )
+
+    @on(OptionList.OptionSelected, "#pick-options")
+    def _selected(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(event.option.id)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class DetailScreen(Screen):
+    """Price chart and statistics for one symbol."""
+
+    BINDINGS = [
+        Binding("escape", "back", "Back"),
+        Binding("1", "range('1')", "1m", show=False),
+        Binding("3", "range('3')", "3m", show=False),
+        Binding("6", "range('6')", "6m", show=False),
+        Binding("y", "range('y')", "1y"),
+        Binding("5", "range('5')", "5y", show=False),
+        Binding("a", "watch", "Watch"),
+        Binding("b", "basket", "Basket"),
+        Binding("o", "open_site", "Open on stooq.com"),
+        Binding("r", "reload", "Refresh"),
+    ]
+
+    def __init__(self, symbol: str, name: str) -> None:
+        super().__init__()
+        self.symbol = symbol.lower()
+        self.display_name = name or symbol.upper()
+        self.range_key = "y"
+        self.df: pd.DataFrame | None = None
+
+    def compose(self) -> ComposeResult:
+        yield Label("", id="detail-header")
+        with Horizontal(id="detail-body"):
+            yield PlotextPlot(id="detail-chart")
+            yield Static("", id="detail-stats")
+        yield Static("", id="detail-status")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self._set_header()
+        self._load()
+
+    def _set_header(self) -> None:
+        ranges = {"1": "1 month", "3": "3 months", "6": "6 months", "y": "1 year", "5": "5 years"}
+        self.query_one("#detail-header", Label).update(
+            f"[b]{self.display_name}[/b]  [dim]{self.symbol.upper()}  "
+            f"daily close, {ranges[self.range_key]}[/dim]"
+        )
+
+    def _status(self, text: str) -> None:
+        self.query_one("#detail-status", Static).update(text)
+
+    @work(thread=True, exclusive=True, group="detail")
+    def _load(self) -> None:
+        app: StooqApp = self.app  # type: ignore[assignment]
+        months = RANGE_MONTHS[self.range_key]
+        years = max(1, -(-months // 12))
+        self.app.call_from_thread(self._begin_loading)
+        try:
+            df = store.get_history(
+                app.client,
+                self.symbol,
+                years=years,
+                progress=lambda msg: self.app.call_from_thread(
+                    self._status, f"Loading {msg}"
+                ),
+            )
+        except StooqError as exc:
+            self.app.call_from_thread(self._fail, str(exc))
+            return
+        self.app.call_from_thread(self._show_history, df)
+
+    def _begin_loading(self) -> None:
+        self.query_one("#detail-chart", PlotextPlot).loading = True
+        self._status("Loading price history...")
+
+    def _fail(self, message: str) -> None:
+        self.query_one("#detail-chart", PlotextPlot).loading = False
+        self._status(f"[red]{message}[/red]")
+
+    def _show_history(self, df: pd.DataFrame) -> None:
+        widget = self.query_one("#detail-chart", PlotextPlot)
+        widget.loading = False
+        if df is None or df.empty:
+            self._status("No price history available for this symbol.")
+            return
+        self.df = df
+        months = RANGE_MONTHS[self.range_key]
+        cutoff = date.today() - timedelta(days=int(months * 30.44))
+        view = df[df["date"] >= cutoff]
+        if view.empty:
+            view = df
+        dark = self.app.current_theme.dark
+        price_chart(
+            widget.plt,
+            list(view["date"]),
+            list(view["close"]),
+            f"{self.symbol.upper()} close",
+            dark,
+        )
+        widget.refresh()
+        self._render_stats(df, view)
+        self._status(
+            f"{len(view)} sessions shown, {len(df)} cached. "
+            "Keys: 1 3 6 y 5 range, a watch, b basket, o open site."
+        )
+
+    def _render_stats(self, df: pd.DataFrame, view: pd.DataFrame) -> None:
+        closes = df["close"].astype(float)
+        last = closes.iloc[-1]
+        prev = closes.iloc[-2] if len(closes) > 1 else last
+        chg = (last / prev - 1.0) * 100.0 if prev else 0.0
+        rets = analytics.log_returns(df.set_index("date")[["close"]].rename(
+            columns={"close": self.symbol.upper()}
+        ))
+        vol30 = (
+            float(rets.tail(30).std().iloc[0]) * (252 ** 0.5) * 100.0
+            if len(rets) >= 10
+            else float("nan")
+        )
+        year = df[df["date"] >= date.today() - timedelta(days=365)]
+        hi52 = float(year["close"].max()) if not year.empty else float("nan")
+        lo52 = float(year["close"].min()) if not year.empty else float("nan")
+        period_ret = (
+            (view["close"].iloc[-1] / view["close"].iloc[0] - 1.0) * 100.0
+            if len(view) > 1
+            else 0.0
+        )
+        # Futures series report a volume column of zeros rather than omitting it.
+        volume = df["volume"].dropna()
+        mean_vol = float(volume.tail(30).mean()) if not volume.empty else 0.0
+        avg_vol = f"{mean_vol:,.0f}" if mean_vol > 0 else "-"
+        vol_text = f"{vol30:.1f}% ann" if vol30 == vol30 else "-"
+        theme = self.app.current_theme
+        up = theme.variables.get("up-color", "green")
+        down = theme.variables.get("down-color", "red")
+        color = up if chg >= 0 else down
+        self.query_one("#detail-stats", Static).update(
+            f"[b]Last[/b]        {fmt_price(last)}\n"
+            f"[b]Day[/b]         [{color}]{chg:+.2f}%[/]\n"
+            f"[b]Period[/b]      {period_ret:+.2f}%\n"
+            f"[b]Vol 30d[/b]     {vol_text}\n"
+            f"[b]52w high[/b]    {fmt_price(hi52)}\n"
+            f"[b]52w low[/b]     {fmt_price(lo52)}\n"
+            f"[b]Avg volume[/b]  {avg_vol}\n"
+            f"[b]First date[/b]  {df['date'].iloc[0]}\n"
+            f"[b]Last date[/b]   {df['date'].iloc[-1]}"
+        )
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
+
+    def action_range(self, key: str) -> None:
+        if key not in RANGE_MONTHS:
+            return
+        self.range_key = key
+        self._set_header()
+        self._load()
+
+    def action_reload(self) -> None:
+        self._load()
+
+    def action_watch(self) -> None:
+        app: StooqApp = self.app  # type: ignore[assignment]
+        app.add_to_watchlist(self.symbol, self.display_name)
+
+    def action_basket(self) -> None:
+        app: StooqApp = self.app  # type: ignore[assignment]
+        app.toggle_basket(self.symbol)
+
+    def action_open_site(self) -> None:
+        webbrowser.open(f"https://stooq.com/q/?s={self.symbol}")
+
+
+class AnalyticsScreen(Screen):
+    """Correlations, rolling correlations, GARCH volatility, and summary stats
+    for the basket of selected symbols."""
+
+    BINDINGS = [
+        Binding("escape", "back", "Back"),
+        Binding("a", "add_symbol", "Add"),
+        Binding("x", "remove_symbol", "Remove"),
+        Binding("w", "cycle_window", "Window"),
+        Binding("t", "cycle_years", "Span"),
+        Binding("r", "recompute", "Recompute"),
+    ]
+
+    WINDOWS = [30, 60, 90, 120]
+    YEARS = [1, 2, 3, 5]
+
+    def compose(self) -> ComposeResult:
+        yield Label("", id="analytics-header")
+        with TabbedContent(id="analytics-tabs"):
+            with TabPane("Correlation", id="tab-corr"):
+                yield DataTable(id="corr-table")
+            with TabPane("Rolling correlation", id="tab-roll"):
+                yield PlotextPlot(id="roll-chart")
+            with TabPane("Volatility (GARCH)", id="tab-garch"):
+                with Horizontal(id="garch-body"):
+                    yield PlotextPlot(id="garch-chart")
+                    yield DataTable(id="garch-table")
+            with TabPane("Statistics", id="tab-stats"):
+                yield DataTable(id="stats-table")
+        yield Static("", id="analytics-status")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        for table_id in ("#corr-table", "#garch-table", "#stats-table"):
+            table = self.query_one(table_id, DataTable)
+            table.zebra_stripes = True
+            table.cursor_type = "row"
+        self._update_header()
+        self._recompute()
+
+    # -- state helpers ------------------------------------------------------
+
+    @property
+    def state(self) -> store.AppState:
+        return self.app.state  # type: ignore[attr-defined]
+
+    def _update_header(self) -> None:
+        basket = ", ".join(s.upper() for s in self.state.basket) or "empty"
+        self.query_one("#analytics-header", Label).update(
+            f"[b]Analytics[/b]  [dim]basket:[/dim] {basket}   "
+            f"[dim]window:[/dim] {self.state.rolling_window}d   "
+            f"[dim]span:[/dim] {self.state.history_years}y"
+        )
+
+    def _status(self, text: str) -> None:
+        self.query_one("#analytics-status", Static).update(text)
+
+    # -- compute ------------------------------------------------------------
+
+    def _recompute(self) -> None:
+        if len(self.state.basket) < 2:
+            self._status(
+                "Add at least two symbols to the basket: press a here, or b on any "
+                "symbol in the market views."
+            )
+            return
+        self._compute()
+
+    @work(thread=True, exclusive=True, group="analytics")
+    def _compute(self) -> None:
+        app: StooqApp = self.app  # type: ignore[assignment]
+        symbols = list(self.state.basket)
+        years = self.state.history_years
+        window = self.state.rolling_window
+        self.app.call_from_thread(self._begin_loading)
+        histories: dict[str, pd.DataFrame] = {}
+        try:
+            for i, sym in enumerate(symbols, 1):
+                self.app.call_from_thread(
+                    self._status, f"Loading history {i}/{len(symbols)}: {sym.upper()}"
+                )
+                histories[sym] = store.get_history(app.client, sym, years=years)
+        except StooqError as exc:
+            self.app.call_from_thread(self._fail, str(exc))
+            return
+
+        self.app.call_from_thread(self._status, "Computing correlations...")
+        closes = analytics.align_closes(histories)
+        if closes.empty or len(closes) < 30 or closes.shape[1] < 2:
+            self.app.call_from_thread(
+                self._fail,
+                "Not enough overlapping history between these symbols to run analytics.",
+            )
+            return
+        rets = analytics.log_returns(closes)
+        corr = analytics.corr_matrix(rets)
+        roll = analytics.rolling_corr(rets, window)
+        stats = analytics.summary_stats(closes)
+
+        self.app.call_from_thread(self._status, "Fitting GARCH(1,1) models...")
+        garch_series: dict[str, pd.Series] = {}
+        garch_params: dict[str, dict] = {}
+        for col in rets.columns:
+            try:
+                series, params = analytics.garch_vol(rets[col])
+                garch_series[col] = series
+                garch_params[col] = params
+            except Exception:
+                continue
+
+        self.app.call_from_thread(
+            self._show_results, corr, roll, stats, garch_series, garch_params, window
+        )
+
+    def _begin_loading(self) -> None:
+        self.query_one("#roll-chart", PlotextPlot).loading = True
+        self.query_one("#garch-chart", PlotextPlot).loading = True
+        self.query_one("#corr-table", DataTable).loading = True
+        self.query_one("#stats-table", DataTable).loading = True
+
+    def _end_loading(self) -> None:
+        self.query_one("#roll-chart", PlotextPlot).loading = False
+        self.query_one("#garch-chart", PlotextPlot).loading = False
+        self.query_one("#corr-table", DataTable).loading = False
+        self.query_one("#stats-table", DataTable).loading = False
+
+    def _fail(self, message: str) -> None:
+        self._end_loading()
+        self._status(f"[red]{message}[/red]")
+
+    def _show_results(
+        self,
+        corr: pd.DataFrame,
+        roll: pd.DataFrame,
+        stats: pd.DataFrame,
+        garch_series: dict[str, pd.Series],
+        garch_params: dict[str, dict],
+        window: int,
+    ) -> None:
+        self._end_loading()
+        dark = self.app.current_theme.dark
+
+        corr_table = self.query_one("#corr-table", DataTable)
+        corr_table.clear(columns=True)
+        corr_table.add_column("")
+        for col in corr.columns:
+            corr_table.add_column(col)
+        for row_sym in corr.index:
+            cells: list = [Text(str(row_sym), style="bold")]
+            for col in corr.columns:
+                value = corr.loc[row_sym, col]
+                style = "bold" if row_sym == col else ""
+                cells.append(Text(f"{value:+.2f}", style=style))
+            corr_table.add_row(*cells)
+
+        roll_chart = self.query_one("#roll-chart", PlotextPlot)
+        if not roll.empty:
+            shown = roll.iloc[:, :6]
+            multi_line_chart(
+                roll_chart.plt,
+                shown,
+                f"Rolling {window}d correlation of daily log returns",
+                "Correlation",
+                dark,
+                hline=0.0,
+            )
+            roll_chart.refresh()
+
+        garch_chart = self.query_one("#garch-chart", PlotextPlot)
+        if garch_series:
+            frame = pd.DataFrame(garch_series)
+            multi_line_chart(
+                garch_chart.plt,
+                frame,
+                "GARCH(1,1) conditional volatility, annualized",
+                "Volatility (%)",
+                dark,
+            )
+            garch_chart.refresh()
+
+        garch_table = self.query_one("#garch-table", DataTable)
+        garch_table.clear(columns=True)
+        for col in ("Symbol", "omega", "alpha", "beta", "a+b", "LR vol"):
+            garch_table.add_column(col)
+        for sym, params in garch_params.items():
+            # An integrated fit (alpha + beta at or above 1) has no finite
+            # long-run variance, so there is no level to report.
+            long_run = params["long_run_vol"]
+            long_run_text = f"{long_run:.1f}%" if long_run == long_run else "-"
+            garch_table.add_row(
+                Text(sym, style="bold"),
+                f"{params['omega']:.4f}",
+                f"{params['alpha']:.3f}",
+                f"{params['beta']:.3f}",
+                f"{params['persistence']:.3f}",
+                long_run_text,
+            )
+
+        stats_table = self.query_one("#stats-table", DataTable)
+        stats_table.clear(columns=True)
+        headers = [
+            ("Symbol", "symbol"),
+            ("Last", "last"),
+            ("Ann ret %", "ann_return_pct"),
+            ("Ann vol %", "ann_vol_pct"),
+            ("Sharpe", "sharpe"),
+            ("Skew", "skew"),
+            ("Kurtosis", "kurtosis"),
+            ("Max DD %", "max_dd_pct"),
+            ("Obs", "obs"),
+        ]
+        for title, _ in headers:
+            stats_table.add_column(title)
+        for _, row in stats.iterrows():
+            stats_table.add_row(
+                Text(str(row["symbol"]), style="bold"),
+                fmt_num(row["last"], 2),
+                f"{row['ann_return_pct']:+.1f}",
+                f"{row['ann_vol_pct']:.1f}",
+                f"{row['sharpe']:+.2f}",
+                f"{row['skew']:+.2f}",
+                f"{row['kurtosis']:+.2f}",
+                f"{row['max_dd_pct']:.1f}",
+                str(int(row["obs"])),
+            )
+
+        pairs = "all pairs" if roll.shape[1] <= 6 else "first 6 pairs"
+        self._status(
+            f"Done. {len(corr)} symbols, rolling chart shows {pairs}. "
+            "Keys: a add, x remove, w window, t span, r recompute."
+        )
+
+    # -- actions ------------------------------------------------------------
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
+
+    def action_add_symbol(self) -> None:
+        def done(hit: SearchHit | None) -> None:
+            if hit is None:
+                return
+            if hit.symbol not in self.state.basket:
+                self.state.basket.append(hit.symbol)
+                store.save_state(self.state)
+            self._update_header()
+            self._recompute()
+
+        self.app.push_screen(AddSymbolScreen("Add symbol to basket"), done)
+
+    def action_remove_symbol(self) -> None:
+        if not self.state.basket:
+            return
+
+        def done(symbol: str | None) -> None:
+            if symbol and symbol in self.state.basket:
+                self.state.basket.remove(symbol)
+                store.save_state(self.state)
+            self._update_header()
+            self._recompute()
+
+        self.app.push_screen(
+            PickSymbolScreen("Remove from basket", list(self.state.basket)), done
+        )
+
+    def action_cycle_window(self) -> None:
+        current = self.state.rolling_window
+        idx = self.WINDOWS.index(current) if current in self.WINDOWS else 0
+        self.state.rolling_window = self.WINDOWS[(idx + 1) % len(self.WINDOWS)]
+        store.save_state(self.state)
+        self._update_header()
+        self._recompute()
+
+    def action_cycle_years(self) -> None:
+        current = self.state.history_years
+        idx = self.YEARS.index(current) if current in self.YEARS else 1
+        self.state.history_years = self.YEARS[(idx + 1) % len(self.YEARS)]
+        store.save_state(self.state)
+        self._update_header()
+        self._recompute()
+
+    def action_recompute(self) -> None:
+        self._recompute()
+
+
+class StooqApp(App):
+    """Market views, search, and analytics over Stooq data."""
+
+    TITLE = "stooq"
+    CSS_PATH = "app.tcss"
+
+    BINDINGS = [
+        Binding("ctrl+l,slash", "focus_search", "Search"),
+        Binding("1", "view('commodities')", "Cmdty", show=False),
+        Binding("2", "view('indices')", "Idx", show=False),
+        Binding("3", "view('fx')", "FX", show=False),
+        Binding("4", "view('equities')", "Eq", show=False),
+        Binding("5", "view('bonds')", "Bond", show=False),
+        Binding("6", "view('macro')", "Macro", show=False),
+        Binding("7", "view('watchlist')", "Watchlist"),
+        Binding("left_square_bracket", "page(-1)", "Prev page", show=False),
+        Binding("right_square_bracket", "page(1)", "Next page", show=False),
+        Binding("a", "watch_selected", "Watch"),
+        Binding("x", "unwatch_selected", "Unwatch", show=False),
+        Binding("b", "basket_selected", "Basket"),
+        Binding("A", "analytics", "Analytics"),
+        Binding("s", "cycle_sort", "Sort", show=False),
+        Binding("r", "refresh", "Refresh"),
+        Binding("f6", "toggle_theme", "Theme"),
+        Binding("question_mark", "help", "Help"),
+        Binding("q", "quit", "Quit", show=False),
+    ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.state = store.load_state()
+        self.client = StooqClient(store.cookie_path())
+        self.rows: list[QuoteRow] = []
+        self.page = 1
+        self.max_page = 1
+        self.sort_mode = 0
+        self._search_hits: list[SearchHit] = []
+        self._search_timer = None
+
+    # -- layout -------------------------------------------------------------
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(id="topbar"):
+            yield Label("[b]stooq[/b]", id="logo")
+            with Horizontal(id="tabbar"):
+                for cat in CATEGORIES:
+                    yield Label(cat.label, id=f"tab-{cat.key}", classes="tab")
+                yield Label("Watchlist", id=f"tab-{WATCHLIST_KEY}", classes="tab")
+            yield Label("", id="page-indicator")
+        yield Input(
+            placeholder="Search symbols and instruments  (Ctrl+L, Enter to open)",
+            id="search",
+        )
+        yield OptionList(id="suggestions")
+        yield DataTable(id="quotes")
+        yield Static("", id="status")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.register_theme(STOOQ_LIGHT)
+        self.register_theme(STOOQ_DARK)
+        self.theme = (
+            self.state.theme if self.state.theme in ("stooq-light", "stooq-dark") else "stooq-light"
+        )
+        table = self.query_one("#quotes", DataTable)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        self.query_one("#suggestions", OptionList).display = False
+        if self.state.view not in VIEW_KEYS:
+            self.state.view = DEFAULT_VIEW
+        self._activate_view(self.state.view)
+        table.focus()
+
+    # -- view loading -------------------------------------------------------
+
+    def _activate_view(self, key: str, page: int = 1) -> None:
+        self.state.view = key
+        store.save_state(self.state)
+        self.page = page
+        self.sort_mode = 0
+        for tab in self.query(".tab"):
+            tab.remove_class("active")
+        self.query_one(f"#tab-{key}", Label).add_class("active")
+        if key == WATCHLIST_KEY:
+            self._load_watchlist()
+        else:
+            category = by_key(key)
+            if category:
+                self._load_category(category.stooq_id, page)
+
+    def status(self, text: str) -> None:
+        self.query_one("#status", Static).update(text)
+
+    def _page_indicator(self) -> None:
+        label = self.query_one("#page-indicator", Label)
+        if self.state.view == WATCHLIST_KEY or self.max_page <= 1:
+            label.update("")
+        else:
+            label.update(f"page {self.page}/{self.max_page}")
+
+    @work(thread=True, exclusive=True, group="load")
+    def _load_category(self, category_id: int, page: int) -> None:
+        self.call_from_thread(self._begin_table_loading, "Loading market data...")
+        try:
+            html = self.client.category_page(category_id, page)
+            rows, max_page = parse_category(html)
+        except StooqError as exc:
+            self.call_from_thread(self._fail_table, str(exc))
+            return
+        self.call_from_thread(self._fill_table, rows, max_page)
+
+    @work(thread=True, exclusive=True, group="load")
+    def _load_watchlist(self) -> None:
+        items = list(self.state.watchlist)
+        if not items:
+            self.call_from_thread(self._fill_table, [], 1)
+            self.call_from_thread(
+                self.status,
+                "Watchlist is empty. Press a on any symbol, or search and press a.",
+            )
+            return
+        self.call_from_thread(self._begin_table_loading, "Refreshing watchlist quotes...")
+        rows: list[QuoteRow] = []
+        for i, item in enumerate(items, 1):
+            symbol, name = item["symbol"], item.get("name", "")
+            self.call_from_thread(
+                self.status, f"Quotes {i}/{len(items)}: {symbol.upper()}"
+            )
+            row = QuoteRow(symbol, name, None, None, None, "")
+            try:
+                hits = parse_search(self.client.search(symbol))
+                for hit in hits:
+                    if hit.symbol == symbol:
+                        row.name = name or hit.name
+                        try:
+                            row.last = float(hit.last.replace(",", ""))
+                        except ValueError:
+                            pass
+                        try:
+                            row.change_pct = float(hit.change_pct.replace("%", ""))
+                        except ValueError:
+                            pass
+                        break
+            except StooqError:
+                pass
+            rows.append(row)
+        self.call_from_thread(self._fill_table, rows, 1)
+
+    def _begin_table_loading(self, message: str) -> None:
+        self.query_one("#quotes", DataTable).loading = True
+        self.status(message)
+
+    def _fail_table(self, message: str) -> None:
+        self.query_one("#quotes", DataTable).loading = False
+        self.status(f"[red]{message}[/red]")
+
+    def _fill_table(self, rows: list[QuoteRow], max_page: int) -> None:
+        self.rows = rows
+        self.max_page = max_page
+        self._render_rows()
+        table = self.query_one("#quotes", DataTable)
+        table.loading = False
+        self._page_indicator()
+        view = self.state.view
+        if view == WATCHLIST_KEY:
+            if rows:
+                self.status(
+                    f"Watchlist: {len(rows)} symbols. Enter opens, x removes, b baskets."
+                )
+        else:
+            label = by_key(view).label if by_key(view) else view
+            self.status(
+                f"{label}: {len(rows)} instruments on this page. "
+                "Enter opens a symbol, ? for all keys."
+            )
+
+    def _sorted_rows(self) -> list[QuoteRow]:
+        mode = SORT_MODES[self.sort_mode]
+        rows = list(self.rows)
+        if mode == "chg desc":
+            rows.sort(key=lambda r: r.change_pct if r.change_pct is not None else -1e9,
+                      reverse=True)
+        elif mode == "chg asc":
+            rows.sort(key=lambda r: r.change_pct if r.change_pct is not None else 1e9)
+        elif mode == "last desc":
+            rows.sort(key=lambda r: r.last if r.last is not None else -1e9, reverse=True)
+        elif mode == "name asc":
+            rows.sort(key=lambda r: r.name.lower())
+        return rows
+
+    def _render_rows(self) -> None:
+        table = self.query_one("#quotes", DataTable)
+        table.clear(columns=True)
+        table.add_column("Symbol", key="symbol")
+        table.add_column("Name", width=38, key="name")
+        table.add_column("Last", key="last")
+        table.add_column("Change %", key="pct")
+        table.add_column("Change", key="abs")
+        table.add_column("Updated", key="when")
+        in_watch = set(self.state.watchlist_symbols())
+        in_basket = set(self.state.basket)
+        for row in self._sorted_rows():
+            marks = ""
+            if row.symbol in in_watch:
+                marks += "*"
+            if row.symbol in in_basket:
+                marks += "+"
+            symbol_text = Text(row.symbol.upper())
+            if marks:
+                symbol_text.append(f" {marks}", style="dim")
+            pct_text, abs_text = change_text(row.change_pct, row.change_abs, self)
+            table.add_row(
+                symbol_text,
+                row.name[:38],
+                fmt_price(row.last),
+                pct_text,
+                abs_text,
+                row.when,
+                key=row.symbol,
+            )
+
+    # -- selection helpers --------------------------------------------------
+
+    def _selected_row(self) -> QuoteRow | None:
+        table = self.query_one("#quotes", DataTable)
+        if not self.rows or table.row_count == 0:
+            return None
+        try:
+            row_key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
+        except Exception:
+            return None
+        for row in self.rows:
+            if row.symbol == row_key.value:
+                return row
+        return None
+
+    def add_to_watchlist(self, symbol: str, name: str) -> None:
+        symbol = symbol.lower()
+        if symbol in self.state.watchlist_symbols():
+            self.notify(f"{symbol.upper()} is already on the watchlist.", timeout=3)
+            return
+        self.state.watchlist.append({"symbol": symbol, "name": name})
+        store.save_state(self.state)
+        self.notify(f"Added {symbol.upper()} to the watchlist.", timeout=3)
+        if self.state.view == WATCHLIST_KEY:
+            self._load_watchlist()
+        else:
+            self._render_rows()
+
+    def remove_from_watchlist(self, symbol: str) -> None:
+        symbol = symbol.lower()
+        before = len(self.state.watchlist)
+        self.state.watchlist = [
+            item for item in self.state.watchlist if item["symbol"] != symbol
+        ]
+        if len(self.state.watchlist) != before:
+            store.save_state(self.state)
+            self.notify(f"Removed {symbol.upper()} from the watchlist.", timeout=3)
+        if self.state.view == WATCHLIST_KEY:
+            self._load_watchlist()
+        else:
+            self._render_rows()
+
+    def toggle_basket(self, symbol: str) -> None:
+        symbol = symbol.lower()
+        if symbol in self.state.basket:
+            self.state.basket.remove(symbol)
+            self.notify(f"{symbol.upper()} removed from analytics basket.", timeout=3)
+        else:
+            self.state.basket.append(symbol)
+            self.notify(
+                f"{symbol.upper()} added to analytics basket "
+                f"({len(self.state.basket)} total). Press A to analyze.",
+                timeout=4,
+            )
+        store.save_state(self.state)
+        self._render_rows()
+
+    # -- search -------------------------------------------------------------
+
+    @on(Input.Changed, "#search")
+    def _search_changed(self, event: Input.Changed) -> None:
+        if self._search_timer is not None:
+            self._search_timer.stop()
+        query = event.value.strip()
+        if len(query) < 2:
+            self._hide_suggestions()
+            return
+        self._search_timer = self.set_timer(0.35, lambda: self._run_search(query))
+
+    @work(thread=True, exclusive=True, group="search")
+    def _run_search(self, query: str) -> None:
+        try:
+            hits = parse_search(self.client.search(query))[:9]
+        except StooqError:
+            hits = []
+        self.call_from_thread(self._show_suggestions, hits)
+
+    def _show_suggestions(self, hits: list[SearchHit]) -> None:
+        self._search_hits = hits
+        options = self.query_one("#suggestions", OptionList)
+        options.clear_options()
+        if not hits:
+            options.display = False
+            return
+        for hit in hits:
+            change = hit.change_pct or ""
+            label = (
+                f"{hit.symbol.upper():<12} {hit.name[:36]:<38} "
+                f"{hit.market[:10]:<11} {hit.last:>10} {change:>8}"
+            )
+            options.add_option(Option(label, id=hit.symbol))
+        options.display = True
+        options.highlighted = 0
+
+    def _hide_suggestions(self) -> None:
+        self._search_hits = []
+        options = self.query_one("#suggestions", OptionList)
+        options.clear_options()
+        options.display = False
+
+    def _hit_by_id(self, option_id: str | None) -> SearchHit | None:
+        for hit in self._search_hits:
+            if hit.symbol == option_id:
+                return hit
+        return None
+
+    @on(Input.Submitted, "#search")
+    def _search_submitted(self) -> None:
+        options = self.query_one("#suggestions", OptionList)
+        if self._search_hits and options.display:
+            index = options.highlighted or 0
+            hit = self._search_hits[min(index, len(self._search_hits) - 1)]
+            self._open_hit(hit)
+
+    @on(OptionList.OptionSelected, "#suggestions")
+    def _suggestion_selected(self, event: OptionList.OptionSelected) -> None:
+        hit = self._hit_by_id(event.option.id)
+        if hit:
+            self._open_hit(hit)
+
+    def _open_hit(self, hit: SearchHit) -> None:
+        self._hide_suggestions()
+        self.query_one("#search", Input).value = ""
+        self.query_one("#quotes", DataTable).focus()
+        self.push_screen(DetailScreen(hit.symbol, hit.name))
+
+    def on_key(self, event) -> None:
+        search = self.query_one("#search", Input)
+        options = self.query_one("#suggestions", OptionList)
+        if search.has_focus and options.display and options.option_count:
+            if event.key in ("down", "up"):
+                delta = 1 if event.key == "down" else -1
+                current = options.highlighted or 0
+                options.highlighted = max(
+                    0, min(options.option_count - 1, current + delta)
+                )
+                event.stop()
+            elif event.key == "escape":
+                self._hide_suggestions()
+                self.query_one("#quotes", DataTable).focus()
+                event.stop()
+        elif search.has_focus and event.key == "escape":
+            search.value = ""
+            self.query_one("#quotes", DataTable).focus()
+            event.stop()
+
+    # -- table interaction --------------------------------------------------
+
+    @on(DataTable.RowSelected, "#quotes")
+    def _row_selected(self, event: DataTable.RowSelected) -> None:
+        symbol = event.row_key.value
+        for row in self.rows:
+            if row.symbol == symbol:
+                self.push_screen(DetailScreen(row.symbol, row.name))
+                return
+
+    # -- actions ------------------------------------------------------------
+
+    def action_focus_search(self) -> None:
+        self.query_one("#search", Input).focus()
+
+    def action_view(self, key: str) -> None:
+        if key in VIEW_KEYS:
+            self._activate_view(key)
+
+    def action_page(self, delta: int) -> None:
+        if self.state.view == WATCHLIST_KEY:
+            return
+        new_page = max(1, min(self.max_page, self.page + delta))
+        if new_page != self.page:
+            self._activate_view(self.state.view, page=new_page)
+
+    def action_refresh(self) -> None:
+        self._activate_view(self.state.view, page=self.page)
+
+    def action_watch_selected(self) -> None:
+        row = self._selected_row()
+        if row:
+            self.add_to_watchlist(row.symbol, row.name)
+
+    def action_unwatch_selected(self) -> None:
+        row = self._selected_row()
+        if row:
+            self.remove_from_watchlist(row.symbol)
+
+    def action_basket_selected(self) -> None:
+        row = self._selected_row()
+        if row:
+            self.toggle_basket(row.symbol)
+
+    def action_analytics(self) -> None:
+        self.push_screen(AnalyticsScreen())
+
+    def action_cycle_sort(self) -> None:
+        self.sort_mode = (self.sort_mode + 1) % len(SORT_MODES)
+        self._render_rows()
+        self.status(f"Sort: {SORT_MODES[self.sort_mode]}")
+
+    def action_toggle_theme(self) -> None:
+        self.theme = "stooq-dark" if self.theme == "stooq-light" else "stooq-light"
+        self.state.theme = self.theme
+        store.save_state(self.state)
+        self._render_rows()
+
+    def action_help(self) -> None:
+        self.push_screen(HelpScreen())
+
+
+def run() -> None:
+    StooqApp().run()

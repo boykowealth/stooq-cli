@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "stooq-cli"
+version = "0.1.0"
+description = "A clean quantitative markets terminal for Stooq data, entirely in your terminal."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Brayden Boyko", email = "brayden@boykowealth.com" }]
+keywords = ["stooq", "markets", "terminal", "tui", "cli", "quant", "finance", "textual"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Office/Business :: Financial :: Investment",
+    "Topic :: Terminals",
+]
+dependencies = [
+    "textual>=1.0",
+    "textual-plotext>=1.0",
+    "beautifulsoup4>=4.12",
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "arch>=6.0",
+    "platformdirs>=4.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.5"]
+
+[project.urls]
+Homepage = "https://github.com/boykowealth/stooq-cli"
+Repository = "https://github.com/boykowealth/stooq-cli"
+
+[project.scripts]
+stooq = "stooq_cli.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["stooq_cli"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

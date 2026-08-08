@@ -1,0 +1,230 @@
+/* stooq-cli: off-black / off-white, one blue accent. Layout only; all
+   palette values come from the registered stooq-light / stooq-dark themes. */
+
+Screen {
+    background: $surface;
+    color: $foreground;
+}
+
+/* -- top bar: logo + view tabs + page indicator -------------------------- */
+#topbar {
+    height: 1;
+    background: $surface;
+    padding: 0 1;
+}
+
+#logo {
+    width: auto;
+    padding: 0 3 0 0;
+    color: $foreground;
+}
+
+#tabbar {
+    height: 1;
+    width: 1fr;
+}
+
+.tab {
+    width: auto;
+    height: 1;
+    padding: 0 2;
+    color: $secondary;
+    background: $surface;
+}
+
+.tab:hover {
+    color: $foreground;
+}
+
+.tab.active {
+    color: $accent;
+    text-style: bold;
+}
+
+#page-indicator {
+    width: auto;
+    color: $secondary;
+    padding: 0 1;
+}
+
+/* -- search bar and suggestion dropdown ---------------------------------- */
+#search {
+    height: 1;
+    margin: 0 1;
+    padding: 0 1;
+    border: none;
+    background: $panel;
+    color: $foreground;
+}
+
+#search:focus {
+    border-left: thick $accent;
+}
+
+#suggestions {
+    display: none;
+    height: auto;
+    max-height: 11;
+    margin: 0 1;
+    background: $surface;
+    border: round $panel;
+}
+
+/* -- quote table --------------------------------------------------------- */
+#quotes {
+    height: 1fr;
+    background: $surface;
+    scrollbar-size-vertical: 1;
+    scrollbar-background: $surface;
+    scrollbar-color: $panel;
+}
+
+DataTable > .datatable--header {
+    background: $surface;
+    color: $secondary;
+    text-style: bold;
+}
+
+DataTable > .datatable--cursor {
+    background: $accent 18%;
+}
+
+/* -- status line --------------------------------------------------------- */
+#status {
+    height: 1;
+    background: $surface;
+    color: $secondary;
+    padding: 0 2;
+}
+
+/* -- symbol detail screen ------------------------------------------------ */
+#detail-header {
+    height: 1;
+    padding: 0 2;
+}
+
+#detail-body {
+    height: 1fr;
+}
+
+#detail-chart {
+    width: 3fr;
+    height: 1fr;
+}
+
+#detail-stats {
+    width: 32;
+    padding: 1 2;
+    border-left: solid $panel;
+}
+
+#detail-status {
+    height: 1;
+    color: $secondary;
+    padding: 0 2;
+}
+
+/* -- analytics screen ---------------------------------------------------- */
+#analytics-header {
+    height: 1;
+    padding: 0 2;
+}
+
+#analytics-tabs {
+    height: 1fr;
+}
+
+#corr-table, #stats-table {
+    height: 1fr;
+}
+
+#garch-body {
+    height: 1fr;
+}
+
+#garch-chart {
+    width: 3fr;
+    height: 1fr;
+}
+
+#garch-table {
+    width: 46;
+    border-left: solid $panel;
+}
+
+#roll-chart {
+    height: 1fr;
+}
+
+#analytics-status {
+    height: 1;
+    color: $secondary;
+    padding: 0 2;
+}
+
+/* -- modals -------------------------------------------------------------- */
+HelpScreen, AddSymbolScreen, PickSymbolScreen {
+    align: center middle;
+    background: $surface 50%;
+}
+
+#help-panel {
+    width: 74;
+    max-width: 94%;
+    height: auto;
+    max-height: 90%;
+    background: $surface;
+    border: round $panel;
+    padding: 1 2;
+}
+
+#help-title {
+    text-style: bold;
+    padding: 0 0 1 0;
+}
+
+#add-panel {
+    width: 84;
+    max-width: 94%;
+    height: auto;
+    background: $surface;
+    border: round $panel;
+    padding: 1 2;
+}
+
+#add-title {
+    text-style: bold;
+    padding: 0 0 1 0;
+}
+
+#add-input {
+    height: 1;
+    border: none;
+    background: $panel;
+    color: $foreground;
+}
+
+#add-input:focus {
+    border-left: thick $accent;
+}
+
+#add-options, #pick-options {
+    height: auto;
+    max-height: 12;
+    background: $surface;
+}
+
+/* Lists: selection is a text color change plus a faint accent wash. */
+OptionList {
+    background: $surface;
+}
+
+OptionList > .option-list--option-highlighted {
+    color: $accent;
+    background: $accent 12%;
+}
+
+/* -- footer -------------------------------------------------------------- */
+Footer {
+    background: $panel;
+}
