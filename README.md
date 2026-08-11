@@ -1,4 +1,4 @@
-# stooq
+# Stooq CLI
 
 A quantitative markets terminal for [Stooq](https://stooq.com) data that runs entirely in your
 terminal. Browse commodities, indices, FX, equities, bonds and macro series in clean tables,
