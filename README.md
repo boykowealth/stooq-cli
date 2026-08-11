@@ -2,7 +2,9 @@
 
 A quantitative markets terminal for [Stooq](https://stooq.com) data that runs entirely in your
 terminal. Browse commodities, indices, FX, equities, bonds and macro series in clean tables,
-chart any symbol, and run correlation and volatility models across a basket you assemble as you go.
+chart any symbol, run correlation and volatility models across a basket you assemble as you go,
+and size a portfolio with momentum signals, standard weighting methodologies and a point in time
+backtest.
 
 Type `stooq`, and the markets are there.
 
@@ -35,6 +37,9 @@ Type `stooq`, and the markets are there.
   - rolling pairwise correlations over a window you can cycle,
   - GARCH(1,1) conditional volatility with the fitted parameters,
   - a summary table of annualized return, volatility, Sharpe, skew, kurtosis and max drawdown.
+- **Portfolio construction and momentum rotation.** Press `P` on the same basket to get momentum
+  rankings, target position sizes under the weighting method of your choice, and a point in time
+  backtest of the whole rule set against an equal weight benchmark.
 - **Loading states everywhere.** Fetches and model fits show progress rather than freezing, and
   every screen reports what it is doing on its status line.
 - **A cache that respects the source.** Daily history is stored locally, so only the days you are
@@ -135,6 +140,25 @@ Symbols on your watchlist are marked with `*`, and those in the analytics basket
 Use the tabs to move between the correlation matrix, rolling correlations, GARCH volatility and
 the summary statistics table.
 
+### Portfolio
+
+Press `P` from anywhere. Every control recomputes the signals, the target weights and the
+backtest together, so you always see one consistent strategy.
+
+| Key | Action |
+| --- | --- |
+| `g` | Strategy: momentum rotation, or buy and hold with rebalancing |
+| `m` | Weighting: equal, inverse volatility, risk parity, minimum variance, maximum Sharpe, momentum weighted |
+| `k` | Momentum signal: total return, 12-1, risk adjusted, trend versus moving average |
+| `p` | Signal lookback: 63, 126, 252 or 504 trading days |
+| `n` | How many holdings a rotation keeps |
+| `f` | Rebalance frequency: monthly, quarterly, yearly |
+| `v` | Risk overlay: none, volatility target, Value at Risk target |
+| `t` | History span used for signals and the backtest |
+| `S` | Allow short positions |
+| `F` | Absolute momentum filter, which sends falling assets to cash |
+| `r` | Recompute |
+
 ### General
 
 | Key | Action |
@@ -165,6 +189,69 @@ dash rather than a misleading number.
 
 **Summary statistics.** Annualized return and volatility (252 trading days), Sharpe ratio against
 a zero risk-free rate, skew, excess kurtosis, maximum drawdown, and the number of observations.
+
+## Portfolio methodology
+
+### Momentum signals
+
+| Signal | Definition |
+| --- | --- |
+| Total return | Simple return over the lookback |
+| 12-1 | Return over the lookback excluding the most recent month |
+| Risk adjusted | Lookback return divided by realized volatility over the same window |
+| Trend | Percentage distance of price above its moving average |
+
+The 12-1 form is the classic academic definition. Skipping the most recent month avoids the
+short-term reversal that often follows a sharp move, and the test suite pins this property by
+checking that a violent spike in the final month leaves a 12-1 score unchanged.
+
+Ranking is cross-sectional: symbols compete against each other. The **absolute momentum filter**
+is separate and is what allows the strategy to hold nothing. Ranking alone will always hold
+something, even when every candidate is falling, so with the filter on, any symbol whose own
+momentum has turned negative goes to cash instead.
+
+### Weighting methodologies
+
+| Method | What it solves for |
+| --- | --- |
+| Equal weight | Every position the same size |
+| Inverse volatility | Size inversely to each asset's own volatility, ignoring correlation |
+| Risk parity | Weights where every position contributes an equal share of portfolio risk |
+| Minimum variance | The lowest variance combination |
+| Maximum Sharpe | The tangency portfolio, highest return per unit of risk |
+| Momentum weighted | Proportional to the momentum score |
+
+The last four are solved numerically with SLSQP under a fully invested constraint and optional
+long-only bounds. Covariance is shrunk toward its diagonal before use, because sample covariance
+on short histories is noisy and often near-singular, which is what makes naive optimizers produce
+wild, unstable weights. If an optimizer fails to converge, the method falls back to inverse
+volatility and says so on the status line rather than failing.
+
+### Risk overlays
+
+A volatility target or Value at Risk target scales total exposure to hit the chosen risk level,
+holding the remainder as cash. Value at Risk is one day at 95 percent under a normal assumption,
+which understates tail risk in exactly the markets where it matters most. **Overlays only ever
+scale exposure down, never above fully invested**, so this de-risks but never adds leverage.
+
+### Backtesting
+
+The engine is strictly point in time. At each rebalance the signal and covariance see only data up
+to and including that date, and the resulting weights earn returns from the following day onward.
+This is the difference between a backtest that means something and one that merely looks good, so
+the test suite verifies it by truncation invariance: results before a cutoff must be identical
+whether or not later data exists. If future prices leaked into past decisions, they would differ.
+
+Reported statistics are total return, CAGR, volatility, Sharpe, Sortino, maximum drawdown, Calmar,
+hit rate, turnover per year, average positions and average cash. An equal weight buy and hold line
+is plotted alongside the strategy as a yardstick.
+
+Two honest limitations. **The backtest applies no trading costs, slippage, spreads or taxes**,
+which flatters high-turnover rotation strategies most, so compare the turnover figure between
+variants before believing an improvement. And **expected returns in the maximum Sharpe optimizer
+are sample means**, which are a notoriously weak predictor of future returns; that method is the
+most sensitive to estimation error of the six, and its weights will move a lot with the span you
+choose. Treat the forecast panel as a guide to risk scale, not as a prediction.
 
 ## How it works
 
@@ -255,14 +342,19 @@ through Textual's pilot with the network stubbed out.
 | `scrape.py` | Parsers for category tables, historical quotes and search |
 | `store.py` | History cache and persisted application state |
 | `analytics.py` | Returns, correlations, GARCH, summary statistics |
+| `signals.py` | Momentum signals, ranking and the absolute momentum filter |
+| `portfolio.py` | Weighting methodologies, optimizers and risk overlays |
+| `backtest.py` | Point in time strategy replay and performance statistics |
 | `charts.py` | Themed, labelled plots |
 | `app.py` | Screens, key bindings and the terminal itself |
 
 ## Roadmap
 
-- Export the current view or basket to CSV
+- Export the current view, weights or backtest to CSV
+- Trading cost and slippage assumptions in the backtest
 - Additional volatility models (EGARCH, GJR-GARCH)
 - Principal component analysis across a basket
+- Walk-forward and out-of-sample testing
 - Custom user-defined views
 
 ## License

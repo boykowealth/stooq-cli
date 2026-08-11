@@ -25,7 +25,7 @@ from textual.widgets import (
 from textual.widgets.option_list import Option
 from textual_plotext import PlotextPlot
 
-from . import analytics, store
+from . import analytics, backtest, portfolio, signals, store
 from .budget import RequestBudget
 from .categories import CATEGORIES, DEFAULT_VIEW, WATCHLIST_KEY, by_key
 from .charts import multi_line_chart, price_chart
@@ -95,11 +95,24 @@ class HelpScreen(ModalScreen):
   s             Cycle table sorting
   r             Refresh data
 
-[b]Analytics[/b]
+[b]Analytics and portfolio[/b]
   A             Open the analytics screen (uses the basket)
+  P             Open the portfolio screen (signals, weights, backtest)
   a / x         Add or remove basket symbols (inside analytics)
   w             Cycle rolling window (30 / 60 / 90 / 120 days)
   t             Cycle history span (1 / 2 / 3 / 5 years)
+
+[b]Portfolio (P)[/b]
+  g             Strategy: momentum rotation or buy and hold
+  m             Weighting: equal, inverse vol, risk parity, min variance,
+                max Sharpe, momentum weighted
+  k / p         Momentum signal kind / lookback period
+  n             How many holdings a rotation keeps
+  f             Rebalance frequency: monthly, quarterly, yearly
+  v             Risk overlay: none, volatility target, VaR target
+  t             History span used for signals and the backtest
+  S             Allow short positions
+  F             Absolute momentum filter (falling assets to cash)
 
 [b]Symbol view[/b]
   1 3 6 y 5     Chart range: 1m, 3m, 6m, 1y, 5y
@@ -738,6 +751,418 @@ class AnalyticsScreen(Screen):
         self._recompute()
 
 
+class PortfolioScreen(Screen):
+    """Momentum signals, target weights and a backtest for the basket."""
+
+    BINDINGS = [
+        Binding("escape", "back", "Back"),
+        Binding("g", "cycle('strategy')", "Strategy"),
+        Binding("m", "cycle('method')", "Weighting"),
+        Binding("k", "cycle('signal')", "Signal"),
+        Binding("p", "cycle('lookback')", "Lookback"),
+        Binding("n", "cycle('top_n')", "Hold N"),
+        Binding("f", "cycle('frequency')", "Rebal"),
+        Binding("v", "cycle('overlay')", "Overlay"),
+        Binding("t", "cycle('span')", "Span"),
+        Binding("S", "toggle_shorts", "Shorts", show=False),
+        Binding("F", "toggle_filter", "Abs filter", show=False),
+        Binding("r", "recompute", "Recompute"),
+    ]
+
+    LOOKBACKS = [63, 126, 252, 504]
+    TOP_N = [1, 2, 3, 5, 8]
+    SPANS = [2, 3, 5, 8]
+    CONFIRM_THRESHOLD = 12
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.closes: pd.DataFrame | None = None
+        self.result: backtest.BacktestResult | None = None
+
+    def compose(self) -> ComposeResult:
+        yield Label("", id="pf-header")
+        yield Label("", id="pf-config")
+        with TabbedContent(id="pf-tabs"):
+            with TabPane("Signals", id="tab-signals"):
+                yield DataTable(id="signal-table")
+            with TabPane("Weights", id="tab-weights"):
+                with Horizontal(id="weights-body"):
+                    yield DataTable(id="weight-table")
+                    yield Static("", id="weight-summary")
+            with TabPane("Backtest", id="tab-backtest"):
+                with Horizontal(id="backtest-body"):
+                    yield PlotextPlot(id="bt-chart")
+                    yield Static("", id="bt-stats")
+        yield Static("", id="pf-status")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        for table_id in ("#signal-table", "#weight-table"):
+            table = self.query_one(table_id, DataTable)
+            table.zebra_stripes = True
+            table.cursor_type = "row"
+        self._update_header()
+        self._recompute()
+
+    # -- state --------------------------------------------------------------
+
+    @property
+    def state(self) -> store.AppState:
+        return self.app.state  # type: ignore[attr-defined]
+
+    @property
+    def spec(self) -> signals.SignalSpec:
+        return signals.SignalSpec(
+            kind=self.state.signal_kind,
+            lookback=self.state.signal_lookback,
+        )
+
+    def _update_header(self) -> None:
+        state = self.state
+        basket = ", ".join(s.upper() for s in state.basket) or "empty"
+        self.query_one("#pf-header", Label).update(
+            f"[b]Portfolio[/b]  [dim]basket:[/dim] {basket}"
+        )
+        strategy = backtest.STRATEGY_LABELS.get(state.strategy, state.strategy)
+        method = portfolio.METHOD_LABELS.get(state.weight_method, state.weight_method)
+        signal = signals.KIND_LABELS.get(state.signal_kind, state.signal_kind)
+        overlay = portfolio.OVERLAY_LABELS.get(state.overlay, state.overlay)
+        bits = [
+            f"[dim]strategy[/dim] {strategy}",
+            f"[dim]weights[/dim] {method}",
+            f"[dim]signal[/dim] {signal} ({state.signal_lookback}d)",
+        ]
+        if state.strategy == "rotation":
+            bits.append(f"[dim]hold[/dim] {state.top_n}")
+        bits.append(f"[dim]rebal[/dim] {backtest.FREQUENCY_LABELS.get(state.rebalance)}")
+        if state.overlay != "none":
+            bits.append(f"[dim]overlay[/dim] {overlay}")
+        if state.allow_shorts:
+            bits.append("[dim]shorts[/dim] on")
+        bits.append(f"[dim]span[/dim] {state.portfolio_years}y")
+        self.query_one("#pf-config", Label).update("   ".join(bits))
+
+    def _status(self, text: str) -> None:
+        self.query_one("#pf-status", Static).update(text)
+
+    # -- compute ------------------------------------------------------------
+
+    def _recompute(self, confirmed: bool = False) -> None:
+        if len(self.state.basket) < 1:
+            self._status(
+                "The basket is empty. Press b on any symbol in the market views to "
+                "add it, then come back here."
+            )
+            return
+        app: StooqApp = self.app  # type: ignore[assignment]
+        start = store.start_for_days(int(self.state.portfolio_years * 365.25))
+        cost = sum(store.estimate_pages(s, start) for s in self.state.basket)
+        if cost > 0 and not confirmed and cost > self.CONFIRM_THRESHOLD:
+            self.app.push_screen(
+                ConfirmScreen(
+                    "Download history?",
+                    f"A {self.state.portfolio_years} year backtest of "
+                    f"{len(self.state.basket)} symbols needs about {cost} requests.\n"
+                    f"Budget today: {app.budget.spent}/{app.budget.effective_limit} used, "
+                    f"{app.budget.remaining} left.\n\n"
+                    "Shorten the span with t to spend less.",
+                ),
+                lambda ok: self._recompute(confirmed=True) if ok else None,
+            )
+            return
+        self._compute()
+
+    @work(thread=True, exclusive=True, group="portfolio")
+    def _compute(self) -> None:
+        app: StooqApp = self.app  # type: ignore[assignment]
+        state = self.state
+        symbols = list(state.basket)
+        start = store.start_for_days(int(state.portfolio_years * 365.25))
+        self.app.call_from_thread(self._begin_loading)
+
+        histories: dict[str, pd.DataFrame] = {}
+        try:
+            for i, sym in enumerate(symbols, 1):
+                self.app.call_from_thread(
+                    self._status, f"Loading history {i}/{len(symbols)}: {sym.upper()}"
+                )
+                histories[sym] = store.get_history(
+                    app.client, sym, start=start, budget=app.budget
+                )
+        except (StooqError, store.BudgetExhausted) as exc:
+            self.app.call_from_thread(self._fail, str(exc))
+            return
+
+        closes = analytics.align_closes(histories)
+        if closes.empty:
+            self.app.call_from_thread(
+                self._fail, "No overlapping price history for these symbols."
+            )
+            return
+        closes.index = pd.to_datetime(closes.index)
+
+        spec = self.spec
+        self.app.call_from_thread(self._status, "Computing signals and weights...")
+        scores = signals.compute(closes, spec)
+
+        # Live target weights use the same code path the backtest uses at each
+        # rebalance, so what you see is what the strategy would actually do.
+        if state.strategy == "rotation":
+            chosen = signals.select_top(scores, state.top_n, state.absolute_filter)
+        else:
+            chosen = list(closes.columns)
+
+        rets = analytics.log_returns(closes)
+        if chosen:
+            weights_result = portfolio.compute_weights(
+                method=state.weight_method,
+                returns=rets[chosen],
+                scores=scores.reindex(chosen),
+                long_only=not state.allow_shorts,
+                overlay=state.overlay,
+                vol_target=state.vol_target,
+                var_target=state.var_target,
+            )
+        else:
+            weights_result = portfolio.WeightResult(
+                pd.Series(dtype=float),
+                state.weight_method,
+                cash=1.0,
+                note="no symbol passed the absolute momentum filter, so the "
+                "strategy would hold cash",
+            )
+
+        self.app.call_from_thread(self._status, "Running backtest...")
+        result = backtest.run(
+            closes,
+            strategy=state.strategy,
+            method=state.weight_method,
+            spec=spec,
+            top_n=state.top_n,
+            frequency=state.rebalance,
+            long_only=not state.allow_shorts,
+            overlay=state.overlay,
+            vol_target=state.vol_target,
+            var_target=state.var_target,
+            absolute_filter=state.absolute_filter,
+            progress=lambda msg: self.app.call_from_thread(
+                self._status, f"Backtesting: {msg}"
+            ),
+        )
+        benchmark = backtest.buy_and_hold_benchmark(closes)
+        self.app.call_from_thread(
+            self._show, closes, scores, chosen, weights_result, result, benchmark
+        )
+
+    def _begin_loading(self) -> None:
+        for wid in ("#signal-table", "#weight-table"):
+            self.query_one(wid, DataTable).loading = True
+        self.query_one("#bt-chart", PlotextPlot).loading = True
+        self._status("Loading...")
+
+    def _end_loading(self) -> None:
+        for wid in ("#signal-table", "#weight-table"):
+            self.query_one(wid, DataTable).loading = False
+        self.query_one("#bt-chart", PlotextPlot).loading = False
+
+    def _fail(self, message: str) -> None:
+        self._end_loading()
+        self._status(f"[red]{message}[/red]")
+
+    # -- render -------------------------------------------------------------
+
+    def _show(self, closes, scores, chosen, weights_result, result, benchmark) -> None:
+        self._end_loading()
+        self.closes = closes
+        self.result = result
+        theme = self.app.current_theme
+        up = theme.variables.get("up-color", "green")
+        down = theme.variables.get("down-color", "red")
+
+        self._show_signals(scores, chosen, up, down)
+        self._show_weights(weights_result, chosen, scores, up, down)
+        self._show_backtest(result, benchmark)
+
+        note = f" {weights_result.note}." if weights_result.note else ""
+        self._status(
+            f"{len(closes)} aligned sessions from {closes.index[0].date()}."
+            f"{note} Keys: g strategy, m weights, k signal, n hold, f rebal, v overlay."
+        )
+
+    def _show_signals(self, scores, chosen, up, down) -> None:
+        table = self.query_one("#signal-table", DataTable)
+        table.clear(columns=True)
+        for col in ("Symbol", "Signal", "Rank", "Status"):
+            table.add_column(col)
+        ranks = signals.rank(scores)
+        for sym in scores.sort_values(ascending=False, na_position="last").index:
+            value = scores[sym]
+            if value != value:  # NaN
+                score_text = Text("-")
+            else:
+                colour = up if value > 0 else down if value < 0 else ""
+                score_text = Text(f"{value:+.2%}", style=colour)
+            held = sym in chosen
+            status = Text("hold", style=up) if held else Text("out", style="dim")
+            table.add_row(
+                Text(str(sym), style="bold"),
+                score_text,
+                str(int(ranks[sym])) if ranks[sym] == ranks[sym] else "-",
+                status,
+            )
+
+    def _show_weights(self, result, chosen, scores, up, down) -> None:
+        table = self.query_one("#weight-table", DataTable)
+        table.clear(columns=True)
+        for col in ("Symbol", "Weight", "Risk share", "Signal"):
+            table.add_column(col)
+        weights = result.weights
+        contributions = result.diagnostics.get("risk_contributions")
+        if weights.empty:
+            table.add_row(Text("cash", style="bold"), "100.00%", "-", "-")
+        else:
+            for sym in weights.sort_values(ascending=False).index:
+                weight = weights[sym]
+                risk = (
+                    f"{contributions[sym]:.1%}"
+                    if contributions is not None and sym in contributions.index
+                    else "-"
+                )
+                score = scores.get(sym, float("nan"))
+                style = up if weight > 0 else down if weight < 0 else "dim"
+                table.add_row(
+                    Text(str(sym), style="bold"),
+                    Text(f"{weight:.2%}", style=style),
+                    risk,
+                    f"{score:+.2%}" if score == score else "-",
+                )
+            if result.cash > 1e-6:
+                table.add_row(Text("cash", style="dim"), f"{result.cash:.2%}", "-", "-")
+
+        diag = result.diagnostics
+        vol = diag.get("vol", float("nan"))
+        exp = diag.get("expected_return", float("nan"))
+        sharpe = diag.get("sharpe", float("nan"))
+        var = diag.get("var_95_1d", float("nan"))
+        self.query_one("#weight-summary", Static).update(
+            "[b]Target portfolio[/b]\n\n"
+            f"Positions     {diag.get('n', 0)}\n"
+            f"Invested      {result.gross:.1%}\n"
+            f"Cash          {result.cash:.1%}\n\n"
+            f"Forecast vol  {vol:.1%} ann\n"
+            f"Expected ret  {exp:+.1%} ann\n"
+            f"Sharpe        {sharpe:+.2f}\n"
+            f"VaR 95% 1d    {var:.2%}\n\n"
+            "[dim]Forecasts use the shrunk\n"
+            "covariance of the selected span.\n"
+            "Expected return is the sample\n"
+            "mean, a weak predictor. Treat\n"
+            "these as risk scale, not as a\n"
+            "promise.[/dim]"
+        )
+
+    def _show_backtest(self, result, benchmark) -> None:
+        widget = self.query_one("#bt-chart", PlotextPlot)
+        stats_widget = self.query_one("#bt-stats", Static)
+        if not result.ok:
+            stats_widget.update(f"[b]Backtest[/b]\n\n{result.note}")
+            widget.plt.clear_figure()
+            widget.refresh()
+            return
+        dark = self.app.current_theme.dark
+        frame = pd.DataFrame({"Strategy": result.equity})
+        if benchmark is not None and not benchmark.empty:
+            aligned = benchmark.reindex(result.equity.index).dropna()
+            if not aligned.empty:
+                frame["Equal weight buy and hold"] = aligned / aligned.iloc[0]
+        multi_line_chart(
+            widget.plt,
+            frame,
+            "Growth of 1.00",
+            "Value",
+            dark,
+            hline=1.0,
+        )
+        widget.refresh()
+
+        s = result.stats
+        theme = self.app.current_theme
+        up = theme.variables.get("up-color", "green")
+        down = theme.variables.get("down-color", "red")
+        ret_colour = up if s.get("total_return", 0) >= 0 else down
+        stats_widget.update(
+            "[b]Backtest[/b]\n\n"
+            f"Total return  [{ret_colour}]{s.get('total_return', 0):+.1%}[/]\n"
+            f"CAGR          {s.get('cagr', float('nan')):+.2%}\n"
+            f"Volatility    {s.get('vol', float('nan')):.1%}\n"
+            f"Sharpe        {s.get('sharpe', float('nan')):+.2f}\n"
+            f"Sortino       {s.get('sortino', float('nan')):+.2f}\n"
+            f"Max drawdown  {s.get('max_drawdown', float('nan')):.1%}\n"
+            f"Calmar        {s.get('calmar', float('nan')):+.2f}\n"
+            f"Hit rate      {s.get('hit_rate', float('nan')):.1%}\n\n"
+            f"Rebalances    {s.get('rebalances', 0)}\n"
+            f"Turnover      {s.get('turnover_per_year', float('nan')):.1f}x per year\n"
+            f"Avg positions {s.get('avg_positions', float('nan')):.1f}\n"
+            f"Avg cash      {s.get('cash_share', float('nan')):.1%}\n"
+            f"Period        {s.get('years', 0):.1f} years\n\n"
+            "[dim]Point in time: weights are set\n"
+            "from data up to each rebalance\n"
+            "and earn the next day's return.\n"
+            "No costs, slippage or taxes.[/dim]"
+        )
+
+    # -- actions ------------------------------------------------------------
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
+
+    def _cycle_value(self, options: list, current):
+        idx = options.index(current) if current in options else -1
+        return options[(idx + 1) % len(options)]
+
+    def action_cycle(self, what: str) -> None:
+        state = self.state
+        if what == "strategy":
+            state.strategy = self._cycle_value(backtest.STRATEGIES, state.strategy)
+        elif what == "method":
+            state.weight_method = self._cycle_value(portfolio.METHODS, state.weight_method)
+        elif what == "signal":
+            state.signal_kind = self._cycle_value(signals.KINDS, state.signal_kind)
+        elif what == "lookback":
+            state.signal_lookback = self._cycle_value(self.LOOKBACKS, state.signal_lookback)
+        elif what == "top_n":
+            state.top_n = self._cycle_value(self.TOP_N, state.top_n)
+        elif what == "frequency":
+            state.rebalance = self._cycle_value(backtest.FREQUENCIES, state.rebalance)
+        elif what == "overlay":
+            state.overlay = self._cycle_value(portfolio.OVERLAYS, state.overlay)
+        elif what == "span":
+            state.portfolio_years = self._cycle_value(self.SPANS, state.portfolio_years)
+        store.save_state(state)
+        self._update_header()
+        self._recompute()
+
+    def action_toggle_shorts(self) -> None:
+        self.state.allow_shorts = not self.state.allow_shorts
+        store.save_state(self.state)
+        self._update_header()
+        self._recompute()
+
+    def action_toggle_filter(self) -> None:
+        self.state.absolute_filter = not self.state.absolute_filter
+        store.save_state(self.state)
+        self.notify(
+            "Absolute momentum filter "
+            + ("on: falling assets go to cash." if self.state.absolute_filter
+               else "off: always fully invested in the top ranked."),
+            timeout=4,
+        )
+        self._recompute()
+
+    def action_recompute(self) -> None:
+        self._recompute()
+
+
 class StooqApp(App):
     """Market views, search, and analytics over Stooq data."""
 
@@ -759,6 +1184,7 @@ class StooqApp(App):
         Binding("x", "unwatch_selected", "Unwatch", show=False),
         Binding("b", "basket_selected", "Basket"),
         Binding("A", "analytics", "Analytics"),
+        Binding("P", "portfolio", "Portfolio"),
         Binding("s", "cycle_sort", "Sort", show=False),
         Binding("r", "refresh", "Refresh"),
         Binding("L", "cycle_limit", "Budget", show=False),
@@ -1187,6 +1613,9 @@ class StooqApp(App):
 
     def action_analytics(self) -> None:
         self.push_screen(AnalyticsScreen())
+
+    def action_portfolio(self) -> None:
+        self.push_screen(PortfolioScreen())
 
     def action_cycle_sort(self) -> None:
         self.sort_mode = (self.sort_mode + 1) % len(SORT_MODES)

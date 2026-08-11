@@ -63,6 +63,19 @@ class AppState:
     rolling_window: int = 60
     history_years: int = 1
     daily_request_limit: int = 0  # 0 means use the built-in default
+    # Portfolio and signal settings
+    strategy: str = "rotation"
+    weight_method: str = "equal"
+    signal_kind: str = "12_1"
+    signal_lookback: int = 252
+    top_n: int = 3
+    rebalance: str = "ME"
+    overlay: str = "none"
+    allow_shorts: bool = False
+    absolute_filter: bool = True
+    portfolio_years: int = 3
+    vol_target: float = 0.10
+    var_target: float = 0.02
 
     def watchlist_symbols(self) -> list[str]:
         return [item["symbol"] for item in self.watchlist]

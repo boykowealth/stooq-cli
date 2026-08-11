@@ -162,6 +162,58 @@ DataTable > .datatable--cursor {
     padding: 0 2;
 }
 
+/* -- portfolio screen ---------------------------------------------------- */
+#pf-header {
+    height: 1;
+    padding: 0 2;
+}
+
+#pf-config {
+    height: 1;
+    padding: 0 2;
+    color: $secondary;
+}
+
+#pf-tabs {
+    height: 1fr;
+}
+
+#signal-table {
+    height: 1fr;
+}
+
+#weights-body, #backtest-body {
+    height: 1fr;
+}
+
+#weight-table {
+    width: 2fr;
+    height: 1fr;
+}
+
+#weight-summary {
+    width: 44;
+    padding: 1 2;
+    border-left: solid $panel;
+}
+
+#bt-chart {
+    width: 2fr;
+    height: 1fr;
+}
+
+#bt-stats {
+    width: 44;
+    padding: 1 2;
+    border-left: solid $panel;
+}
+
+#pf-status {
+    height: 1;
+    color: $secondary;
+    padding: 0 2;
+}
+
 /* -- modals -------------------------------------------------------------- */
 HelpScreen, AddSymbolScreen, PickSymbolScreen, ConfirmScreen {
     align: center middle;
