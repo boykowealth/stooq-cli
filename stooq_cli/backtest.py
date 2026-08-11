@@ -52,6 +52,53 @@ FREQUENCY_LABELS = {
 }
 
 
+@dataclass(frozen=True)
+class CostModel:
+    """What trading actually costs.
+
+    Commission and slippage are charged in basis points on the notional
+    traded, so a rebalance that moves 40 percent of the portfolio pays the
+    combined rate on 0.40. Defaults are realistic for a retail account in
+    liquid instruments; illiquid or small-cap names cost considerably more.
+
+    Tax is deliberately zero by default. When set, it is charged on realized
+    gains at each rebalance, approximated as the share of the portfolio being
+    sold multiplied by the gain since the previous rebalance. There is no lot
+    tracking, no distinction between short and long term rates, and no loss
+    carryforward, so treat it as an order of magnitude, not a tax return.
+    """
+
+    commission_bps: float = 5.0
+    slippage_bps: float = 5.0
+    tax_rate: float = 0.0
+
+    @property
+    def rate(self) -> float:
+        """Combined cost per unit of notional traded."""
+        return max(0.0, (self.commission_bps + self.slippage_bps) / 10_000.0)
+
+    @property
+    def is_free(self) -> bool:
+        return self.rate <= 0 and self.tax_rate <= 0
+
+    def describe(self) -> str:
+        parts = [f"{self.commission_bps:g}bp commission", f"{self.slippage_bps:g}bp slippage"]
+        if self.tax_rate > 0:
+            parts.append(f"{self.tax_rate:.0%} tax")
+        return ", ".join(parts)
+
+    def short(self) -> str:
+        """Compact form for the config strip, where space is tight."""
+        combined = self.commission_bps + self.slippage_bps
+        text = f"{combined:g}bp"
+        if self.tax_rate > 0:
+            text += f" +{self.tax_rate:.0%} tax"
+        return text
+
+
+DEFAULT_COSTS = CostModel()
+
+
 @dataclass
 class BacktestResult:
     equity: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
@@ -78,17 +125,23 @@ def rebalance_dates(index: pd.DatetimeIndex, frequency: str) -> list:
     return [index[int(i)] for i in grouped.values]
 
 
-def performance_stats(returns: pd.Series, equity: pd.Series) -> dict:
-    """Standard summary of a return stream. Returns are simple, not log."""
+def performance_stats(returns: pd.Series, equity: pd.Series, initial: float = 1.0) -> dict:
+    """Standard summary of a return stream. Returns are simple, not log.
+
+    Total return is compounded from the return stream rather than read off the
+    equity curve's endpoints, because the curve's first value already contains
+    the first day's return and dividing by it would silently discard that day.
+    """
     if returns.empty or equity.empty:
         return {}
     periods = len(returns)
     years = periods / TRADING_DAYS
-    total = float(equity.iloc[-1] / equity.iloc[0]) if equity.iloc[0] else 1.0
+    total = float((1.0 + returns).prod())
     cagr = total ** (1 / years) - 1.0 if years > 0 and total > 0 else float("nan")
     vol = float(returns.std() * np.sqrt(TRADING_DAYS))
     sharpe = (float(returns.mean() * TRADING_DAYS) / vol) if vol > 0 else float("nan")
-    running_max = equity.cummax()
+    # The book started at `initial`, so the high water mark is never below it.
+    running_max = equity.cummax().clip(lower=initial)
     drawdown = equity / running_max - 1.0
     max_dd = float(drawdown.min())
     downside = returns[returns < 0]
@@ -167,6 +220,7 @@ def run(
     vol_target: float = 0.10,
     var_target: float = 0.02,
     absolute_filter: bool = True,
+    costs: CostModel | None = None,
     progress=None,
 ) -> BacktestResult:
     """Replay `strategy` over `closes` and report performance.
@@ -216,39 +270,96 @@ def run(
     if start >= len(dates):
         return BacktestResult(note="The first rebalance falls on the last day of history.")
 
+    costs = costs or DEFAULT_COSTS
     active = dates[start:]
-    held = pd.DataFrame(0.0, index=active, columns=frame.columns)
-    current = weights_by_date[candidates[0]]
-    schedule = {d: w for d, w in weights_by_date.items()}
-    turnover_total = 0.0
-    previous = pd.Series(0.0, index=frame.columns)
-    turnover_total += float((current - previous).abs().sum()) / 2.0
-    previous = current
+    schedule = dict(weights_by_date.items())
+    columns = frame.columns
+
+    # Weights in force during each day, which is what earns that day's return.
+    # They were decided at the previous close, so this stays point in time.
+    held = pd.DataFrame(0.0, index=active, columns=columns)
+    gross = pd.Series(0.0, index=active, dtype=float)
+    cost_drag = pd.Series(0.0, index=active, dtype=float)
+    tax_drag = pd.Series(0.0, index=active, dtype=float)
+
+    current = weights_by_date[candidates[0]].reindex(columns).fillna(0.0)
+    traded_total = float(current.abs().sum())
+
+    equity = 1.0
+    equity_at_last_rebalance = 1.0
+    equity_curve = pd.Series(0.0, index=active, dtype=float)
+
+    # Costs are charged on the day the new position starts earning, matching
+    # the convention that weights decided at a close take effect next day. A
+    # rebalance on the final day of history therefore costs nothing, because
+    # the position it would have opened never existed.
+    pending_cost = traded_total * costs.rate
+    pending_tax = 0.0
 
     for day in active:
-        if day in schedule:
-            new = schedule[day]
-            turnover_total += float((new - previous).abs().sum()) / 2.0
-            previous = new
-            current = new
+        if pending_cost or pending_tax:
+            before = equity
+            equity *= max(0.0, 1.0 - pending_cost - pending_tax)
+            realized = (equity / before - 1.0) if before else 0.0
+            split = pending_cost + pending_tax
+            if split > 0:
+                cost_drag.loc[day] = realized * (pending_cost / split)
+                tax_drag.loc[day] = realized * (pending_tax / split)
+            equity_at_last_rebalance = equity
+            pending_cost = pending_tax = 0.0
+
         held.loc[day] = current.values
+        day_returns = daily.loc[day]
+        gross_return = float((current * day_returns).sum())
+        gross.loc[day] = gross_return
+        equity *= 1.0 + gross_return
 
-    # Weights set at the close of day t earn day t+1's return, so shifting the
-    # held frame by one day is what keeps the test honest.
-    strategy_returns = (held.shift(1).fillna(0.0) * daily.loc[active]).sum(axis=1)
-    equity = (1.0 + strategy_returns).cumprod()
+        # Positions drift with prices between rebalances. Cash earns nothing,
+        # so it simply becomes a larger or smaller share of the total.
+        denominator = 1.0 + gross_return
+        if abs(denominator) > 1e-12:
+            current = (current * (1.0 + day_returns)) / denominator
+            current = current.reindex(columns).fillna(0.0)
 
-    stats = performance_stats(strategy_returns, equity)
-    stats["turnover_per_year"] = (
-        turnover_total / stats["years"] if stats.get("years") else float("nan")
-    )
+        if day in schedule:
+            target = schedule[day].reindex(columns).fillna(0.0)
+            traded = float((target - current).abs().sum())
+            traded_total += traded
+            pending_cost = traded * costs.rate
+
+            if costs.tax_rate > 0 and equity_at_last_rebalance > 0:
+                gain = equity / equity_at_last_rebalance - 1.0
+                if gain > 0:
+                    # Only the part of the book being sold realizes a gain.
+                    sold = float((current - target).clip(lower=0.0).sum())
+                    pending_tax = costs.tax_rate * sold * gain
+            current = target
+
+        equity_curve.loc[day] = equity
+
+    net_returns = equity_curve.pct_change()
+    if len(equity_curve) > 0:
+        net_returns.iloc[0] = float(equity_curve.iloc[0] - 1.0)
+
+    stats = performance_stats(net_returns, equity_curve)
+    years = stats.get("years") or float("nan")
+    # Turnover is conventionally one-way, so half the notional traded.
+    stats["turnover_per_year"] = (traded_total / 2.0) / years if years else float("nan")
     stats["rebalances"] = len(candidates)
     stats["avg_positions"] = float((held.abs() > 1e-6).sum(axis=1).mean())
     stats["cash_share"] = float((1.0 - held.abs().sum(axis=1)).clip(lower=0).mean())
 
+    gross_equity = (1.0 + gross).cumprod()
+    stats["gross_total_return"] = float(gross_equity.iloc[-1] - 1.0)
+    stats["cost_drag"] = float(stats["gross_total_return"] - stats["total_return"])
+    stats["costs_paid"] = float(-cost_drag.sum())
+    stats["tax_paid"] = float(-tax_drag.sum())
+    stats["traded_notional"] = traded_total
+    stats["cost_model"] = costs.describe()
+
     return BacktestResult(
-        equity=equity,
-        returns=strategy_returns,
+        equity=equity_curve,
+        returns=net_returns,
         weights_history=held,
         stats=stats,
         rebalances=len(candidates),

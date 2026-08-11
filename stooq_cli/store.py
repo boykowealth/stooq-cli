@@ -76,6 +76,11 @@ class AppState:
     portfolio_years: int = 3
     vol_target: float = 0.10
     var_target: float = 0.02
+    # Trading frictions. Defaults are realistic for retail in liquid names;
+    # tax is off by default because it depends entirely on your jurisdiction.
+    commission_bps: float = 5.0
+    slippage_bps: float = 5.0
+    tax_rate: float = 0.0
 
     def watchlist_symbols(self) -> list[str]:
         return [item["symbol"] for item in self.watchlist]

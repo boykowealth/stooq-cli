@@ -215,9 +215,57 @@ DataTable > .datatable--cursor {
 }
 
 /* -- modals -------------------------------------------------------------- */
-HelpScreen, AddSymbolScreen, PickSymbolScreen, ConfirmScreen {
+HelpScreen, AddSymbolScreen, PickSymbolScreen, ConfirmScreen, CostsScreen {
     align: center middle;
     background: $surface 50%;
+}
+
+#costs-panel {
+    width: 62;
+    max-width: 94%;
+    height: auto;
+    background: $surface;
+    border: round $accent;
+    padding: 1 2;
+}
+
+#costs-title {
+    text-style: bold;
+    padding: 0 0 1 0;
+}
+
+#costs-intro, #costs-note {
+    height: auto;
+    color: $secondary;
+    padding: 0 0 1 0;
+}
+
+.cost-row {
+    height: 1;
+    margin: 0 0 1 0;
+}
+
+.cost-label {
+    width: 22;
+    color: $foreground;
+}
+
+.cost-input {
+    width: 1fr;
+    height: 1;
+    border: none;
+    padding: 0 1;
+    background: $panel;
+    color: $foreground;
+}
+
+.cost-input:focus {
+    border-left: thick $accent;
+}
+
+#costs-hint {
+    color: $secondary;
+    padding: 1 0 0 0;
 }
 
 #confirm-panel {

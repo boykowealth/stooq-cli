@@ -111,6 +111,7 @@ class HelpScreen(ModalScreen):
   f             Rebalance frequency: monthly, quarterly, yearly
   v             Risk overlay: none, volatility target, VaR target
   t             History span used for signals and the backtest
+  c             Trading costs: commission, slippage and tax
   S             Allow short positions
   F             Absolute momentum filter (falling assets to cash)
 
@@ -751,6 +752,103 @@ class AnalyticsScreen(Screen):
         self._recompute()
 
 
+class CostsScreen(ModalScreen[bool]):
+    """Edit commission, slippage and tax. Blank or invalid entries keep the
+    previous value rather than rejecting the whole dialog."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("ctrl+r", "reset", "Defaults"),
+    ]
+
+    def __init__(self, state: store.AppState) -> None:
+        super().__init__()
+        self._state = state
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="costs-panel"):
+            yield Label("Trading costs", id="costs-title")
+            yield Static(
+                "Charged on the notional traded at each rebalance, so they bite "
+                "hardest on high turnover strategies.",
+                id="costs-intro",
+            )
+            with Horizontal(classes="cost-row"):
+                yield Label("Commission (bps)", classes="cost-label")
+                yield Input(
+                    value=f"{self._state.commission_bps:g}",
+                    id="in-commission",
+                    classes="cost-input",
+                )
+            with Horizontal(classes="cost-row"):
+                yield Label("Slippage (bps)", classes="cost-label")
+                yield Input(
+                    value=f"{self._state.slippage_bps:g}",
+                    id="in-slippage",
+                    classes="cost-input",
+                )
+            with Horizontal(classes="cost-row"):
+                yield Label("Tax on gains (%)", classes="cost-label")
+                yield Input(
+                    value=f"{self._state.tax_rate * 100:g}",
+                    id="in-tax",
+                    classes="cost-input",
+                )
+            yield Static(
+                "100 bps is 1 percent. Tax is applied to realized gains at each "
+                "rebalance, approximated without lot tracking.",
+                id="costs-note",
+            )
+            yield Label(
+                "[b]Enter[/b] apply   [b]Ctrl+R[/b] defaults   [b]Esc[/b] cancel",
+                id="costs-hint",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#in-commission", Input).focus()
+
+    @staticmethod
+    def _read(widget: Input, fallback: float, low: float, high: float) -> float:
+        text = widget.value.strip()
+        if not text:
+            return fallback
+        try:
+            value = float(text)
+        except ValueError:
+            return fallback
+        if value != value:  # NaN
+            return fallback
+        return max(low, min(high, value))
+
+    @on(Input.Submitted)
+    def _submit(self) -> None:
+        self.action_apply()
+
+    def action_apply(self) -> None:
+        state = self._state
+        state.commission_bps = self._read(
+            self.query_one("#in-commission", Input), state.commission_bps, 0.0, 500.0
+        )
+        state.slippage_bps = self._read(
+            self.query_one("#in-slippage", Input), state.slippage_bps, 0.0, 500.0
+        )
+        state.tax_rate = (
+            self._read(self.query_one("#in-tax", Input), state.tax_rate * 100, 0.0, 90.0)
+            / 100.0
+        )
+        store.save_state(state)
+        self.dismiss(True)
+
+    def action_reset(self) -> None:
+        defaults = backtest.CostModel()
+        self.query_one("#in-commission", Input).value = f"{defaults.commission_bps:g}"
+        self.query_one("#in-slippage", Input).value = f"{defaults.slippage_bps:g}"
+        self.query_one("#in-tax", Input).value = "0"
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
 class PortfolioScreen(Screen):
     """Momentum signals, target weights and a backtest for the basket."""
 
@@ -764,6 +862,7 @@ class PortfolioScreen(Screen):
         Binding("f", "cycle('frequency')", "Rebal"),
         Binding("v", "cycle('overlay')", "Overlay"),
         Binding("t", "cycle('span')", "Span"),
+        Binding("c", "edit_costs", "Costs"),
         Binding("S", "toggle_shorts", "Shorts", show=False),
         Binding("F", "toggle_filter", "Abs filter", show=False),
         Binding("r", "recompute", "Recompute"),
@@ -817,6 +916,14 @@ class PortfolioScreen(Screen):
             lookback=self.state.signal_lookback,
         )
 
+    @property
+    def costs(self) -> backtest.CostModel:
+        return backtest.CostModel(
+            commission_bps=self.state.commission_bps,
+            slippage_bps=self.state.slippage_bps,
+            tax_rate=self.state.tax_rate,
+        )
+
     def _update_header(self) -> None:
         state = self.state
         basket = ", ".join(s.upper() for s in state.basket) or "empty"
@@ -840,6 +947,7 @@ class PortfolioScreen(Screen):
         if state.allow_shorts:
             bits.append("[dim]shorts[/dim] on")
         bits.append(f"[dim]span[/dim] {state.portfolio_years}y")
+        bits.append(f"[dim]costs[/dim] {self.costs.short()}")
         self.query_one("#pf-config", Label).update("   ".join(bits))
 
     def _status(self, text: str) -> None:
@@ -945,6 +1053,7 @@ class PortfolioScreen(Screen):
             vol_target=state.vol_target,
             var_target=state.var_target,
             absolute_filter=state.absolute_filter,
+            costs=self.costs,
             progress=lambda msg: self.app.call_from_thread(
                 self._status, f"Backtesting: {msg}"
             ),
@@ -1090,9 +1199,14 @@ class PortfolioScreen(Screen):
         up = theme.variables.get("up-color", "green")
         down = theme.variables.get("down-color", "red")
         ret_colour = up if s.get("total_return", 0) >= 0 else down
+        drag = s.get("cost_drag", 0.0)
         stats_widget.update(
-            "[b]Backtest[/b]\n\n"
+            "[b]Backtest[/b]  [dim]net of costs[/dim]\n\n"
             f"Total return  [{ret_colour}]{s.get('total_return', 0):+.1%}[/]\n"
+            f"Gross return  {s.get('gross_total_return', 0):+.1%}\n"
+            f"Cost drag     [{down}]-{abs(drag):.1%}[/]\n"
+            f"  commission  {abs(s.get('costs_paid', 0.0)):.2%}\n"
+            f"  tax         {abs(s.get('tax_paid', 0.0)):.2%}\n"
             f"CAGR          {s.get('cagr', float('nan')):+.2%}\n"
             f"Volatility    {s.get('vol', float('nan')):.1%}\n"
             f"Sharpe        {s.get('sharpe', float('nan')):+.2f}\n"
@@ -1105,10 +1219,9 @@ class PortfolioScreen(Screen):
             f"Avg positions {s.get('avg_positions', float('nan')):.1f}\n"
             f"Avg cash      {s.get('cash_share', float('nan')):.1%}\n"
             f"Period        {s.get('years', 0):.1f} years\n\n"
-            "[dim]Point in time: weights are set\n"
-            "from data up to each rebalance\n"
-            "and earn the next day's return.\n"
-            "No costs, slippage or taxes.[/dim]"
+            "[dim]Charged on notional traded, on\n"
+            "the day each new position starts.\n"
+            "Press c to change them.[/dim]"
         )
 
     # -- actions ------------------------------------------------------------
@@ -1141,6 +1254,14 @@ class PortfolioScreen(Screen):
         store.save_state(state)
         self._update_header()
         self._recompute()
+
+    def action_edit_costs(self) -> None:
+        def done(changed: bool | None) -> None:
+            if changed:
+                self._update_header()
+                self._recompute()
+
+        self.app.push_screen(CostsScreen(self.state), done)
 
     def action_toggle_shorts(self) -> None:
         self.state.allow_shorts = not self.state.allow_shorts

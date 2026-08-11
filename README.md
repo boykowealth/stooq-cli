@@ -155,6 +155,7 @@ backtest together, so you always see one consistent strategy.
 | `f` | Rebalance frequency: monthly, quarterly, yearly |
 | `v` | Risk overlay: none, volatility target, Value at Risk target |
 | `t` | History span used for signals and the backtest |
+| `c` | Trading costs: commission, slippage and tax |
 | `S` | Allow short positions |
 | `F` | Absolute momentum filter, which sends falling assets to cash |
 | `r` | Recompute |
@@ -246,12 +247,40 @@ Reported statistics are total return, CAGR, volatility, Sharpe, Sortino, maximum
 hit rate, turnover per year, average positions and average cash. An equal weight buy and hold line
 is plotted alongside the strategy as a yardstick.
 
-Two honest limitations. **The backtest applies no trading costs, slippage, spreads or taxes**,
-which flatters high-turnover rotation strategies most, so compare the turnover figure between
-variants before believing an improvement. And **expected returns in the maximum Sharpe optimizer
-are sample means**, which are a notoriously weak predictor of future returns; that method is the
-most sensitive to estimation error of the six, and its weights will move a lot with the span you
-choose. Treat the forecast panel as a guide to risk scale, not as a prediction.
+Positions drift with prices between rebalances. Only at a rebalance are they traded back to
+target, which is what makes turnover, and therefore cost, meaningful.
+
+### Trading costs, slippage and tax
+
+Press `c` on the portfolio screen to edit all three. They are applied to the backtest, and the
+stats panel reports gross return, net return and the drag between them, split into commission and
+tax.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| Commission | 5 bps | Charged on the notional traded |
+| Slippage | 5 bps | The gap between the price you assumed and the price you got |
+| Tax | 0 percent | Charged on realized gains at each rebalance |
+
+The defaults come to 10 bps per unit of notional traded, roughly 20 bps on a round trip, which is
+realistic for a retail account in liquid instruments. Illiquid names, small caps and wide spreads
+cost considerably more, so raise them if that is what you trade. Tax defaults to zero because it
+depends entirely on your jurisdiction and account type.
+
+Costs are charged on the day each new position starts earning, matching the rule that weights
+decided at a close take effect the next day. A rebalance falling on the last day of the data is
+therefore free, because the position it would have opened never existed.
+
+Two things to keep in mind about the tax figure. It is **an approximation without lot tracking**:
+at each rebalance it charges the tax rate on the share of the book being sold multiplied by the
+gain since the previous rebalance. There is no distinction between short and long term rates and
+no loss carryforward. It also correctly charges nothing on a losing strategy, since there are no
+gains to tax.
+
+The remaining honest limitation is that **expected returns in the maximum Sharpe optimizer are
+sample means**, a notoriously weak predictor of future returns. That method is the most sensitive
+to estimation error of the six, and its weights will move a lot with the span you choose. Treat
+the forecast panel as a guide to risk scale, not as a prediction.
 
 ## How it works
 
@@ -351,7 +380,6 @@ through Textual's pilot with the network stubbed out.
 ## Roadmap
 
 - Export the current view, weights or backtest to CSV
-- Trading cost and slippage assumptions in the backtest
 - Additional volatility models (EGARCH, GJR-GARCH)
 - Principal component analysis across a basket
 - Walk-forward and out-of-sample testing

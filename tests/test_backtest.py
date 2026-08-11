@@ -11,6 +11,7 @@ import pytest
 from stooq_cli import backtest, signals
 
 SHORT = signals.SignalSpec(kind="total_return", lookback=60, skip=0)
+FREE = backtest.CostModel(commission_bps=0.0, slippage_bps=0.0, tax_rate=0.0)
 
 
 def prices(spec: dict, n: int = 500, seed: int = 0) -> pd.DataFrame:
@@ -46,15 +47,40 @@ def test_no_lookahead_truncation_invariance():
     )
 
 
-def test_weights_are_applied_the_day_after_they_are_set():
-    """Weights decided at the close of day t must earn day t+1's return."""
+def test_returns_come_from_the_weights_in_force_that_day():
+    """weights_history records what was actually held during each day, so
+    without costs the return stream is exactly that book times that day's
+    moves. Point in time decision making is covered by the truncation test."""
     frame = prices({"A": (0.001, 0.01), "B": (0.0005, 0.01)}, n=400)
-    result = backtest.run(frame, strategy="buy_and_hold", method="equal", spec=SHORT)
+    result = backtest.run(
+        frame, strategy="buy_and_hold", method="equal", spec=SHORT, costs=FREE
+    )
     daily = frame.pct_change().fillna(0.0)
     expected = (
-        result.weights_history.shift(1).fillna(0.0) * daily.loc[result.weights_history.index]
+        result.weights_history * daily.loc[result.weights_history.index]
     ).sum(axis=1)
     pd.testing.assert_series_equal(result.returns, expected, check_names=False)
+
+
+def test_weights_drift_between_rebalances():
+    """Between rebalances the book is left alone, so a rising asset must
+    become a larger share without any trade taking place."""
+    n = 300
+    idx = pd.date_range("2022-01-03", periods=n, freq="B")
+    # A climbs steadily, B is flat, so A's weight must grow between rebalances.
+    frame = pd.DataFrame(
+        {"A": 100 * np.exp(np.cumsum(np.full(n, 0.004))), "B": np.full(n, 100.0)},
+        index=idx,
+    )
+    result = backtest.run(
+        frame, strategy="buy_and_hold", method="equal", spec=SHORT,
+        frequency="YE", costs=FREE,
+    )
+    held = result.weights_history["A"]
+    assert held.iloc[0] == pytest.approx(0.5, abs=1e-6), "should start equally weighted"
+    # A rises every day and B is flat, so A's share must grow every single day.
+    assert held.is_monotonic_increasing, "weights were reset instead of drifting"
+    assert held.iloc[-1] > held.iloc[0] + 0.02, "drift was negligible"
 
 
 def test_rotation_goes_to_cash_when_everything_falls():
@@ -133,6 +159,97 @@ def test_every_weighting_method_runs_in_a_backtest(method):
     # Long-only: never short, never levered.
     assert (result.weights_history >= -1e-9).all().all()
     assert (result.weights_history.sum(axis=1) <= 1.0 + 1e-6).all()
+
+
+def test_costs_reduce_returns():
+    frame = prices({"A": (0.0008, 0.012), "B": (0.0004, 0.012), "C": (0.0006, 0.015)}, n=600)
+    free = backtest.run(frame, strategy="rotation", method="equal", spec=SHORT,
+                        top_n=1, costs=FREE)
+    charged = backtest.run(frame, strategy="rotation", method="equal", spec=SHORT,
+                           top_n=1, costs=backtest.CostModel(5.0, 5.0, 0.0))
+    assert charged.stats["total_return"] < free.stats["total_return"]
+    assert charged.stats["cost_drag"] > 0
+    assert charged.stats["gross_total_return"] == pytest.approx(
+        free.stats["total_return"], rel=1e-9
+    ), "gross of costs must match the free run exactly"
+
+
+def test_higher_cost_rate_costs_more():
+    frame = prices({"A": (0.0008, 0.012), "B": (0.0004, 0.012)}, n=600)
+    cheap = backtest.run(frame, strategy="rotation", method="equal", spec=SHORT,
+                         top_n=1, costs=backtest.CostModel(1.0, 1.0, 0.0))
+    dear = backtest.run(frame, strategy="rotation", method="equal", spec=SHORT,
+                        top_n=1, costs=backtest.CostModel(25.0, 25.0, 0.0))
+    assert dear.stats["cost_drag"] > cheap.stats["cost_drag"]
+
+
+def test_costs_hurt_high_turnover_strategies_more():
+    """The point of modelling costs: they penalise churn."""
+    frame = prices({"A": (0.001, 0.025), "B": (0.001, 0.025), "C": (0.001, 0.025)},
+                   n=700, seed=7)
+    costs = backtest.CostModel(10.0, 10.0, 0.0)
+    rotation = backtest.run(frame, strategy="rotation", method="equal", spec=SHORT,
+                            top_n=1, frequency="ME", costs=costs)
+    hold = backtest.run(frame, strategy="buy_and_hold", method="equal", spec=SHORT,
+                        frequency="YE", costs=costs)
+    assert rotation.stats["turnover_per_year"] > hold.stats["turnover_per_year"]
+    assert rotation.stats["cost_drag"] > hold.stats["cost_drag"]
+
+
+def test_zero_cost_model_is_free():
+    frame = prices({"A": (0.0008, 0.012), "B": (0.0004, 0.012)}, n=500)
+    result = backtest.run(frame, strategy="rotation", method="equal", spec=SHORT,
+                          top_n=1, costs=FREE)
+    assert result.stats["cost_drag"] == pytest.approx(0.0, abs=1e-12)
+    assert result.stats["costs_paid"] == pytest.approx(0.0, abs=1e-12)
+    assert result.stats["tax_paid"] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_tax_only_applies_to_gains():
+    """A strategy that never makes money must never owe tax."""
+    falling = prices({"A": (-0.002, 0.008), "B": (-0.0025, 0.008)}, n=500)
+    taxed = backtest.run(falling, strategy="rotation", method="equal", spec=SHORT,
+                         top_n=1, absolute_filter=False,
+                         costs=backtest.CostModel(0.0, 0.0, 0.35))
+    assert taxed.stats["tax_paid"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_tax_reduces_a_winning_strategy():
+    rising = prices({"A": (0.002, 0.008), "B": (0.0015, 0.008)}, n=600)
+    free = backtest.run(rising, strategy="rotation", method="equal", spec=SHORT,
+                        top_n=1, costs=FREE)
+    taxed = backtest.run(rising, strategy="rotation", method="equal", spec=SHORT,
+                         top_n=1, costs=backtest.CostModel(0.0, 0.0, 0.35))
+    assert taxed.stats["tax_paid"] > 0
+    assert taxed.stats["total_return"] < free.stats["total_return"]
+
+
+def test_rebalance_on_the_final_day_is_not_charged():
+    """A trade whose position never gets to exist must not cost anything.
+    This is what keeps results stable under truncation."""
+    frame = prices({"A": (0.0008, 0.012), "B": (0.0004, 0.012)}, n=500)
+    costs = backtest.CostModel(50.0, 50.0, 0.0)
+    full = backtest.run(frame, strategy="rotation", method="equal", spec=SHORT,
+                        top_n=1, costs=costs)
+    cut = frame.index[430]
+    trunc = backtest.run(frame.loc[:cut], strategy="rotation", method="equal",
+                         spec=SHORT, top_n=1, costs=costs)
+    overlap = trunc.returns.index.intersection(full.returns.index)
+    pd.testing.assert_series_equal(
+        full.returns.loc[overlap], trunc.returns.loc[overlap],
+        check_names=False, rtol=1e-12,
+    )
+
+
+def test_cost_model_describe_is_readable():
+    assert "5bp commission" in backtest.CostModel().describe()
+    assert "tax" not in backtest.CostModel().describe()
+    assert "30% tax" in backtest.CostModel(5.0, 5.0, 0.30).describe()
+    assert FREE.is_free
+    assert not backtest.CostModel().is_free
+    # The compact form has to stay short enough for the config strip.
+    assert backtest.CostModel().short() == "10bp"
+    assert backtest.CostModel(5.0, 5.0, 0.30).short() == "10bp +30% tax"
 
 
 def test_insufficient_history_reports_instead_of_crashing():

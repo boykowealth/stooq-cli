@@ -131,6 +131,89 @@ async def test_empty_basket_explains_itself(app):
         assert app.screen.__class__.__name__ == "PortfolioScreen"
 
 
+async def test_costs_dialog_applies_values(app):
+    async with app.run_test(size=(150, 44)) as pilot:
+        await pilot.pause(0.4)
+        app.push_screen(PortfolioScreen())
+        await settle(pilot, app)
+        await pilot.press("c")
+        await pilot.pause(0.3)
+        assert app.screen.__class__.__name__ == "CostsScreen"
+        commission = app.screen.query_one("#in-commission")
+        commission.value = "12.5"
+        app.screen.query_one("#in-slippage").value = "7"
+        app.screen.query_one("#in-tax").value = "20"
+        app.screen.action_apply()
+        await pilot.pause(0.4)
+        assert app.state.commission_bps == 12.5
+        assert app.state.slippage_bps == 7.0
+        assert app.state.tax_rate == pytest.approx(0.20)
+        assert await settle(pilot, app) != "TIMEOUT"
+
+
+async def test_costs_dialog_rejects_nonsense_without_breaking(app):
+    """Garbage input must keep the previous value, not crash or zero it."""
+    async with app.run_test(size=(150, 44)) as pilot:
+        await pilot.pause(0.4)
+        app.state.commission_bps = 5.0
+        app.push_screen(PortfolioScreen())
+        await settle(pilot, app)
+        await pilot.press("c")
+        await pilot.pause(0.3)
+        app.screen.query_one("#in-commission").value = "not a number"
+        app.screen.query_one("#in-slippage").value = ""
+        app.screen.query_one("#in-tax").value = "-40"
+        app.screen.action_apply()
+        await pilot.pause(0.4)
+        assert app.state.commission_bps == 5.0  # unchanged
+        assert app.state.slippage_bps == 5.0  # unchanged
+        assert app.state.tax_rate == 0.0  # clamped up from negative
+        assert app.screen.__class__.__name__ == "PortfolioScreen"
+
+
+async def test_costs_dialog_cancel_changes_nothing(app):
+    async with app.run_test(size=(150, 44)) as pilot:
+        await pilot.pause(0.4)
+        app.state.commission_bps = 5.0
+        app.push_screen(PortfolioScreen())
+        await settle(pilot, app)
+        await pilot.press("c")
+        await pilot.pause(0.3)
+        app.screen.query_one("#in-commission").value = "99"
+        await pilot.press("escape")
+        await pilot.pause(0.4)
+        assert app.state.commission_bps == 5.0
+
+
+async def test_costs_are_reflected_in_the_backtest(app):
+    async with app.run_test(size=(150, 44)) as pilot:
+        await pilot.pause(0.4)
+        app.state.commission_bps = 0.0
+        app.state.slippage_bps = 0.0
+        app.state.strategy = "rotation"
+        app.state.top_n = 1
+        app.push_screen(PortfolioScreen())
+        await settle(pilot, app)
+        free = app.screen.result.stats["total_return"]
+
+        app.state.commission_bps = 50.0
+        app.state.slippage_bps = 50.0
+        app.screen.action_recompute()
+        await settle(pilot, app)
+        charged = app.screen.result.stats["total_return"]
+        assert charged < free
+        assert app.screen.result.stats["cost_drag"] > 0
+
+
+def test_default_costs_are_realistic_and_tax_free():
+    model = backtest.CostModel()
+    assert model.commission_bps == 5.0
+    assert model.slippage_bps == 5.0
+    assert model.tax_rate == 0.0
+    # 10 bps per unit traded, so about 20 bps on a full round trip.
+    assert model.rate == pytest.approx(0.001)
+
+
 def test_labels_exist_for_every_option():
     """Every selectable option needs a human readable label, or the header
     would show a raw identifier."""
