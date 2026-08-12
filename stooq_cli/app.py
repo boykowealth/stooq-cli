@@ -31,6 +31,7 @@ from .categories import CATEGORIES, DEFAULT_VIEW, WATCHLIST_KEY, by_key
 from .charts import multi_line_chart, price_chart
 from .client import StooqClient, StooqError
 from .scrape import QuoteRow, SearchHit, parse_category, parse_search
+from .strategies_screen import StrategiesScreen
 from .themes import STOOQ_DARK, STOOQ_LIGHT
 
 VIEW_KEYS = [c.key for c in CATEGORIES] + [WATCHLIST_KEY]
@@ -98,6 +99,7 @@ class HelpScreen(ModalScreen):
 [b]Analytics and portfolio[/b]
   A             Open the analytics screen (uses the basket)
   P             Open the portfolio screen (signals, weights, backtest)
+  R             Open the strategies screen (saved multi-portfolio strategies)
   a / x         Add or remove basket symbols (inside analytics)
   w             Cycle rolling window (30 / 60 / 90 / 120 days)
   t             Cycle history span (1 / 2 / 3 / 5 years)
@@ -1306,6 +1308,7 @@ class StooqApp(App):
         Binding("b", "basket_selected", "Basket"),
         Binding("A", "analytics", "Analytics"),
         Binding("P", "portfolio", "Portfolio"),
+        Binding("R", "strategies", "Strategies"),
         Binding("s", "cycle_sort", "Sort", show=False),
         Binding("r", "refresh", "Refresh"),
         Binding("L", "cycle_limit", "Budget", show=False),
@@ -1737,6 +1740,9 @@ class StooqApp(App):
 
     def action_portfolio(self) -> None:
         self.push_screen(PortfolioScreen())
+
+    def action_strategies(self) -> None:
+        self.push_screen(StrategiesScreen())
 
     def action_cycle_sort(self) -> None:
         self.sort_mode = (self.sort_mode + 1) % len(SORT_MODES)

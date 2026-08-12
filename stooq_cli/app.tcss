@@ -182,8 +182,19 @@ DataTable > .datatable--cursor {
     height: 1fr;
 }
 
-#weights-body, #backtest-body {
+#weights-body, #backtest-body, #strat-body {
     height: 1fr;
+}
+
+#strat-weight-table {
+    width: 2fr;
+    height: 1fr;
+}
+
+#strat-summary {
+    width: 46;
+    padding: 1 2;
+    border-left: solid $panel;
 }
 
 #weight-table {
