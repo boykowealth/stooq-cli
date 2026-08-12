@@ -11,3 +11,10 @@ venv/
 htmlcov/
 *.svg.tmp
 .DS_Store
+
+# Canadian Levered Rotation strategy: local-only data/output/secrets
+strategies/can_lev_rotation/data_cache/
+strategies/can_lev_rotation/output/
+strategies/can_lev_rotation/.env
+strategies/can_lev_rotation/BUILD_SPEC.md
+*.parquet
