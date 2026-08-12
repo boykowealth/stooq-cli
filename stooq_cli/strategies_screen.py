@@ -1,13 +1,9 @@
 """Strategies screen: shows the saved multi-portfolio strategies (currently the default
 Canadian Sector + Commodity Rotation) and their latest computed target weights, read
-straight from the app's own data directory — the same place `strategies/can_lev_rotation`
-writes to after each run (manual or the Wednesday cron job). This screen never computes
-anything itself; it is a read-only view onto the last run.
-
-Deliberately reads the saved JSON directly (via `platformdirs`, already a core dependency)
-rather than importing the `strategies` package, so this screen works in a normal `pipx`
-install of Stooq CLI where `strategies/` (a repo-only research package, not shipped in the
-wheel) isn't on the import path — only its *output* needs to be reachable.
+straight from the app's own data directory. The strategy code itself lives in a separate
+private repo (public-markets-trading) — this screen only reads its JSON output, via a
+well-known local path, never by importing across repos. Read-only: it never computes
+anything itself.
 """
 
 from __future__ import annotations
@@ -85,9 +81,8 @@ class StrategiesScreen(Screen):
         if not names:
             header.update("[b]Strategies[/b]")
             status.update(
-                "No saved strategy yet. From the repo root: "
-                "`python -m strategies.can_lev_rotation.run` builds and saves the "
-                "default Canadian Sector + Commodity Rotation strategy."
+                "No saved strategy yet. Run `python -m sector_rotation.run` from the "
+                "strategy repo to build and save the default strategy's weights here."
             )
             return
 
@@ -100,21 +95,17 @@ class StrategiesScreen(Screen):
         if run is None:
             status.update(
                 f"'{name}' is saved but has no run yet. Run "
-                "`python -m strategies.can_lev_rotation.run` to compute target weights."
+                "`python -m sector_rotation.run` to compute target weights."
             )
             return
 
         table.add_columns("Ticker", "Fund", "State", "Weight")
-        winner = run.get("winner_variant", "shorts_enabled")
-        wt_key = "wt shorts-on" if winner == "shorts_enabled" else "wt long-only"
         for row in run.get("current_weights", []):
-            w = row.get(wt_key, 0.0) or 0.0
-            table.add_row(
-                row.get("ticker", ""), row.get("fund", ""),
-                row.get("state (shorts on)", "-"), f"{w:+.1%}",
-            )
+            w = row.get("weight", 0.0) or 0.0
+            table.add_row(row.get("ticker", ""), row.get("fund", ""),
+                          row.get("state", "-"), f"{w:+.1%}")
 
-        m = run.get(winner, {})
+        m = run.get("metrics", {})
 
         def pct(key: str) -> str:
             v = m.get(key)
@@ -126,7 +117,6 @@ class StrategiesScreen(Screen):
 
         lines = [
             f"[b]{cfg.get('description', name)}[/b]", "",
-            f"[dim]variant live[/dim] {winner}",
             f"[dim]window[/dim] {run.get('window', {}).get('start', '?')} "
             f"→ {run.get('window', {}).get('end', '?')}",
             f"[dim]generated[/dim] {run.get('generated_at', '?')}", "",

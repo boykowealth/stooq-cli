@@ -40,10 +40,10 @@ Type `stooq`, and the markets are there.
 - **Portfolio construction and momentum rotation.** Press `P` on the same basket to get momentum
   rankings, target position sizes under the weighting method of your choice, and a point in time
   backtest of the whole rule set against an equal weight benchmark.
-- **Saved multi-portfolio strategies.** Press `R` to open a read-only view of the strategies
-  saved under `strategies/` (default: a Canadian sector + commodity momentum/value rotation,
-  real ETFs only, no leverage) — their latest target weights, live state, and headline metrics,
-  refreshed by a weekly cron job. See `strategies/can_lev_rotation/README.md`.
+- **Saved multi-portfolio strategies.** Press `R` to open a read-only view of strategies saved
+  by external strategy repos (they write their config and latest run to Stooq CLI's own app
+  data directory) — target weights, live state, and headline metrics, refreshed by whatever
+  cadence that strategy's own automation runs on.
 - **Loading states everywhere.** Fetches and model fits show progress rather than freezing, and
   every screen reports what it is doing on its status line.
 - **A cache that respects the source.** Daily history is stored locally, so only the days you are
